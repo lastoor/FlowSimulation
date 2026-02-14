@@ -224,3 +224,13 @@ def generate_logk_field(fbm_gen):
     elapsed_time_fbm = time.time() - start_time_fbm
     return_msg = f'fBm field generated successfully after {np.round(elapsed_time_fbm, 4)} seconds.'
     return logk_field, return_msg
+
+
+class ExpCov:
+    def __init__(self, sigma=1.0, length_scale=1.0):
+        self.sigma = sigma
+        self.length_scale = length_scale
+        self.is_even = True
+    def __call__(self, x):
+        r = np.linalg.norm(x)
+        return self.sigma**2 * np.exp(-np.abs(r) / self.length_scale)
