@@ -166,3 +166,16 @@ def dijkstra_2d_least_resistance(K, start_region, end_region, average='harmonic'
         path_array = np.empty((0, 2), dtype=int)
 
     return path_array, total_resistance, actual_start_node, actual_end_node, resistance_map
+
+def run_lazymole(path_lazymole, path_lminputfile):
+    # print('LAZYMOLE is runninng... ')
+    start_time = time.time()
+    proc = subprocess.run([path_lazymole, path_lminputfile], capture_output = True, text = True)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    if proc.returncode == 0:
+        return_msg = f'LAZYMOLE ran successfully after {np.round(elapsed_time, 4)} seconds.'
+    else:
+        return_msg = f"LAZYMOLE ran unsuccessfully after {np.round(elapsed_time, 4)} seconds. Return code: {proc.returncode}."
+
+    return return_msg

@@ -134,7 +134,7 @@ def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000):
     return h, msg, is_success
 
 
-def compute_velocity(K, x, y, h, output_location="cell"):
+def compute_velocity(K, x, y, h, output_location="face"):
     """
     Compute Darcy velocity using MODFLOW-consistent face discretization.
     Kept for reference; compute_velocity implements the same formulation per USGS TM6-A16 Ch. 2.

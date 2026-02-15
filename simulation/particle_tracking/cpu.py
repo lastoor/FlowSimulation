@@ -1,11 +1,10 @@
 """
-Particle tracking using RK45 integration.
+CPU particle tracking using RK45 (Dormand–Prince) integration with Numba.
 """
 
-import numpy as np
 import math
+import numpy as np
 from numba import njit
-from collections import Counter
 
 
 @njit(inline='always')
@@ -72,18 +71,13 @@ def rhs_arclength(x, y, xgrid, ygrid, vx, vy, nx, ny, eps_speed):
     For z=[x,y,t], dz/ds = [vx/|v|, vy/|v|, 1/|v|].
     Runs on a single CPU thread.
     """
-    # 1. CALL AND CAPTURE THE RETURNED VELOCITIES (vx, vy)
     vx_at_p, vy_at_p = bilinear_sample(xgrid, ygrid, vx, vy, nx, ny, x, y)
-
-    # 2. CALCULATE SPEED USING THE RETURNED VALUES
     sp = norm2(vx_at_p, vy_at_p)
 
     if not math.isfinite(sp) or sp < eps_speed:
         return 0.0, 0.0, 1e30, sp
 
     inv = 1.0 / sp
-
-    # 3. CALCULATE RATES using the captured values
     rate_x = vx_at_p * inv
     rate_y = vy_at_p * inv
     rate_t = inv
@@ -283,39 +277,3 @@ def particle_tracking_cpu(params):
     return paths_x, paths_y, paths_t, lengths, status
 
 
-def fastest_trajectory(px, py, pt, L, st):
-    nP = L.shape[0]
-
-    # Valid if success and at least 1 point
-    valid = (st == 0) & (L > 0)
-
-    # Initialize with NaN so invalid ones don't get picked
-    travel_times = np.full(nP, np.nan, dtype=pt.dtype)
-
-    # Extract final time for each valid trajectory
-    idx = np.where(valid)[0]
-    if idx.size > 0:
-        # vectorized gather of last times
-        travel_times[idx] = pt[idx, L[idx] - 1]
-
-    # Find fastest (minimum travel time)
-    if np.all(np.isnan(travel_times)):
-        raise RuntimeError("No successful trajectories with valid travel time.")
-
-    fastest_id = int(np.nanargmin(travel_times))
-    fastest_time = float(travel_times[fastest_id])
-
-    # Extract the polyline coordinates/time for the fastest trajectory
-    k = L[fastest_id]
-    x_fast = px[fastest_id, :k].copy()
-    y_fast = py[fastest_id, :k].copy()
-    t_fast = pt[fastest_id, :k].copy()
-
-    return {
-        "particle_id": fastest_id,
-        "travel_time": fastest_time,
-        "x": x_fast,
-        "y": y_fast,
-        "t": t_fast,
-        "all_travel_times": travel_times  # useful for histograms, optional
-    }
