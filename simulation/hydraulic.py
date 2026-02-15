@@ -171,3 +171,210 @@ def compute_velocity(K, x, y, h):
     vx = -K * dhdx
     vy = -K * dhdy
     return vx, vy
+
+
+def run_modflow(mf2005_config):
+    """
+    Run MODFLOW simulation using flopy.
+    
+    Parameters
+    ----------
+    mf2005_config : dict
+        Configuration dictionary containing:
+        - lx, ly, lz : Domain dimensions
+        - dx, dy, dz : Grid spacing
+        - grad_head : Hydraulic head gradient
+        - model_ws : Model workspace directory
+        - modflow_exe : Path to MODFLOW executable
+        - model_name : Model name
+        - outftl_name : Output file name
+        - logk_field : Log-transformed hydraulic conductivity field
+    
+    Returns
+    -------
+    return_msg : str
+        Status message indicating success/failure and elapsed time.
+    """
+    # Import packages inside function to avoid top-level dependency
+    import os
+    import time
+    import flopy
+    
+    # Set LD_LIBRARY_PATH if needed for MODFLOW executable
+    os.environ["LD_LIBRARY_PATH"] = "/apps/generic/gcc/13.3.0/lib64:" + os.environ.get("LD_LIBRARY_PATH", "")
+    
+    # Initialize the model parameters
+    lx = mf2005_config['lx']
+    ly = mf2005_config['ly']
+    lz = mf2005_config['lz']
+    dx = mf2005_config['dx']
+    dy = mf2005_config['dy']
+    dz = mf2005_config['dz']
+    delta_h = mf2005_config['grad_head'] * lx
+    model_ws = str(mf2005_config['model_ws'])
+    modflow_exe = str(mf2005_config['modflow_exe'])
+    model_name = str(mf2005_config['model_name'])
+    outftl_name  = str(mf2005_config['outftl_name'])
+    k_field = np.exp(mf2005_config['logk_field'])
+
+    # Initialize flopy
+    mf = flopy.modflow.Modflow(model_name, model_ws = model_ws, exe_name = modflow_exe)
+
+    # Add DIS package to the MODFLOW model
+    ztop = 0.
+    zbot = np.zeros((lz, ly, lx))
+    for i in range(lz):
+        zbot[i, :, :] = ztop - dz*(i+1)
+
+    dis = flopy.modflow.ModflowDis(mf, lz, ly, lx, delr = dy, delc = dx, top = ztop, botm = zbot, perlen = 1)
+
+    # Variables for the BAS package
+    ibound = np.ones((lz, ly, lx), dtype = np.int32)
+    ibound[:, :,  0] = -1
+    ibound[:, :, -1] = -1
+
+    strt = np.zeros((lz, ly, lx), dtype = np.float32)
+    for i in range(lz):
+        for j in range(ly):
+            strt[i, j, :] = np.linspace(delta_h, 0, num = lx)
+
+    bas = flopy.modflow.ModflowBas(mf, ibound = ibound, strt = strt)
+
+    # Add LPF package to the MODFLOW model
+    lpf = flopy.modflow.ModflowLpf(mf, hk = k_field, vka = 1.)
+
+    # Add OC package to the MODFLOW model
+    oc = flopy.modflow.ModflowOc(
+        mf,
+        stress_period_data={(0, 0): ["save head", "save budget"]},
+        compact=True,
+    )
+
+    # Add PCG package to the MODFLOW model
+    pcg = flopy.modflow.ModflowPcg(mf, hclose=1e-10, rclose=1e-10, mxiter=2000, iter1=1000)
+
+    # Add LMT package to the MODFLOW model
+    lmt = flopy.modflow.ModflowLmt(mf, output_file_header = 'extended',
+                                    output_file_format = 'formatted',
+                                    output_file_name = outftl_name)
+
+    # Write the MODFLOW model input files
+    mf.write_input()
+    
+    # Run the MODFLOW model
+    start_time = time.time()
+    is_successful, buff = mf.run_model(silent=True)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+
+    status = "successfully" if is_successful else "unsuccessfully"
+    return_msg = f'MODFLOW ran {status} after {np.round(elapsed_time, 4)} seconds.'
+
+    return return_msg
+
+def read_mt3d_file(filepath):
+    """
+    Reads a velocity field file with a specific mixed format.
+
+    Args:
+        filepath (str): The path to the input file.
+
+    Returns:
+        dict: A dictionary containing the parsed variables.
+    """
+    # Import re module inside function to avoid top-level dependency
+    import re
+    
+    variables = {}
+    with open(filepath, 'r') as f:
+        # Read the main header line and the next line of integers
+        main_header = f.readline().strip()
+        _ = f.readline().strip().split() # Read and discard the integer line
+
+        variables['header'] = main_header
+
+        # --- This pattern of reading 2D arrays is repeated ---
+        def read_2d_array(file_handle):
+            data_list = []
+            while True:
+                # Store the current position in case we read too far
+                last_pos = file_handle.tell()
+                line = file_handle.readline()
+
+                
+                # Check for end of file
+                if not line:
+                    break
+                
+                # The dimension line is the delimiter between variable blocks
+                if re.match(r'^\s*(\d+\s+){4}\d+\s*$', line):
+                    dims = [int(x) for x in line.split()]
+                    break
+                
+                # If it's not a dimension line, rewind and read the header of the next block
+                if "'" in line:
+                    file_handle.seek(last_pos)
+                    dims = None # Signal that we didn't find a dimension line
+                    break
+                    
+                data_list.extend(line.strip().split())
+            
+            # If a dimension line was found, reshape the array
+            if dims:
+                rows, cols = dims[2], dims[3]
+                return np.array(data_list, dtype=float).reshape((rows, cols))
+            return None # Should not happen in a well-formed file for these vars
+
+        # Read the first variable block: THKSAT
+        var_header = f.readline().strip()
+        variable_name = var_header.strip("' ")
+        variables[variable_name] = read_2d_array(f)
+        
+        # Read the second variable block: QXX
+        var_header = f.readline().strip()
+        variable_name = var_header.strip("' ")
+        variables[variable_name] = read_2d_array(f)
+        
+        # Read the third variable block: QYY
+        var_header = f.readline().strip()
+        variable_name = var_header.strip("' ")
+        variables[variable_name] = read_2d_array(f)
+
+        # Read the fourth variable block: CNH
+        var_header_line = f.readline()
+        match = re.search(r"'(.*?)'\s+(\d+)", var_header_line)
+        if match:
+            variable_name = match.group(1).strip()
+            num_records = int(match.group(2))
+        else:
+            raise ValueError(f"Failed to parse CNH header line: {var_header_line}")
+
+        _ = f.readline()
+
+        # --- FIX IS HERE ---
+        cnh_data = []
+        for i in range(num_records):
+            line = f.readline()
+
+            # Safely handle the end of file or blank lines
+            if not line or not line.strip():
+                print(f"Warning: Expected {num_records} records for '{variable_name}', but found a blank line or EOF after {i} records.")
+                break # Stop reading this block
+
+            line_parts = line.strip().split()
+            
+            # Defensive check for expected number of columns
+            if len(line_parts) < 4:
+                print(f"Warning: Skipping malformed line in '{variable_name}' data: {line.strip()}")
+                continue # Skip this line and go to the next
+
+            cnh_data.append([
+                int(line_parts[0]),
+                int(line_parts[1]),
+                int(line_parts[2]),
+                float(line_parts[3])
+            ])
+        variables[variable_name] = np.array(cnh_data)
+        # --- END OF FIX ---
+
+    return variables
