@@ -36,3 +36,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test outputs
+tests/Compare_Modflow_PETSc/*.png
+tests/Compare_Modflow_PETSc/mf2005_output/
