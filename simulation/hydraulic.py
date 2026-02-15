@@ -5,7 +5,7 @@ Hydraulic head solving and velocity computation.
 import numpy as np
 
 
-def solve_head(K, x, y, dh=0.01, rtol=1e-6, atol=1e-20, max_it=10000):
+def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000):
     """
     Solve ∇·(K∇h) = 0 in a 2D domain with:
     - Dirichlet BCs on left/right: h(left)=dh*x_len, h(right)=0
@@ -35,8 +35,10 @@ def solve_head(K, x, y, dh=0.01, rtol=1e-6, atol=1e-20, max_it=10000):
     from petsc4py import PETSc
 
     ny, nx = K.shape
-    dx = np.diff(np.concatenate(([0], x + 0.5*(x[1]-x[0]))))
-    dy = np.diff(np.concatenate(([0], y + 0.5*(y[1]-y[0]))))
+    # dx = np.diff(np.concatenate(([0], x + 0.5*(x[1]-x[0]))))
+    # dy = np.diff(np.concatenate(([0], y + 0.5*(y[1]-y[0]))))
+    dx = np.full(nx, 1.0/nx)
+    dy = np.full(ny, 1.0/ny)
     dz = 1.0
 
     def lid(i, j): return i*nx + j
@@ -132,45 +134,112 @@ def solve_head(K, x, y, dh=0.01, rtol=1e-6, atol=1e-20, max_it=10000):
     return h, msg, is_success
 
 
-def compute_velocity(K, x, y, h):
+def compute_velocity(K, x, y, h, output_location="cell"):
     """
-    Compute Darcy velocity components (vx, vy) from head field h(x,y).
+    Compute Darcy velocity using MODFLOW-consistent face discretization.
+    Kept for reference; compute_velocity implements the same formulation per USGS TM6-A16 Ch. 2.
 
     Parameters
     ----------
     K : 2D np.ndarray
-        Hydraulic conductivity at cell centers, shape (ny, nx)
+        Hydraulic conductivity at cell centers, shape (ny, nx).
     x, y : 1D np.ndarray
-        Cell-center coordinates in x and y directions
+        Cell-center coordinates in x and y directions.
     h : 2D np.ndarray
-        Hydraulic head field, shape (ny, nx)
+        Hydraulic head field at cell centers, shape (ny, nx).
+    output_location : str, optional
+        Output velocity location:
+        - "cell": return cell-centered velocity fields (ny, nx) via averaging.
+        - "face": return face-centered velocity fields:
+          vx -> (ny, nx+1), vy -> (ny+1, nx).
+        Default is "cell".
 
     Returns
     -------
     vx, vy : 2D np.ndarray
-        Darcy velocity components in x and y directions
-        vx = -K * ∂h/∂x, vy = -K * ∂h/∂y
+        Darcy velocity components.
     """
+    if output_location not in ("cell", "face"):
+        raise ValueError("output_location must be either 'cell' or 'face'")
+
     ny, nx = h.shape
-    dhdx = np.zeros_like(h)
-    dhdy = np.zeros_like(h)
 
-    # --- x-derivative (central interior, one-sided edges)
-    for i in range(ny):
-        dhdx[i, 1:-1] = (h[i, 2:] - h[i, :-2]) / (x[2:] - x[:-2])
-        dhdx[i, 0] = (h[i, 1] - h[i, 0]) / (x[1] - x[0])
-        dhdx[i, -1] = (h[i, -1] - h[i, -2]) / (x[-1] - x[-2])
+    def hmean(a, b):
+        return 2.0 * a * b / (a + b + 1e-300)
 
-    # --- y-derivative (central interior, one-sided edges)
-    for j in range(nx):
-        dhdy[1:-1, j] = (h[2:, j] - h[:-2, j]) / (y[2:] - y[:-2])
-        dhdy[0, j] = (h[1, j] - h[0, j]) / (y[1] - y[0])
-        dhdy[-1, j] = (h[-1, j] - h[-2, j]) / (y[-1] - y[-2])
+    # Build cell widths from center coordinates using midpoint edges.
+    # This avoids spuriously halving the first cell when coordinates start at 0.
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size != nx or y.size != ny:
+        raise ValueError("x and y must match h dimensions")
+    if nx < 2 or ny < 2:
+        raise ValueError("compute_velocity requires at least 2 cells in each direction")
 
-    # --- Darcy velocity
-    vx = -K * dhdx
-    vy = -K * dhdy
-    return vx, vy
+    x_edges = np.empty(nx + 1, dtype=float)
+    x_edges[1:-1] = 0.5 * (x[:-1] + x[1:])
+    x_edges[0] = x[0] - 0.5 * (x[1] - x[0])
+    x_edges[-1] = x[-1] + 0.5 * (x[-1] - x[-2])
+    dx = np.diff(x_edges)
+
+    y_edges = np.empty(ny + 1, dtype=float)
+    y_edges[1:-1] = 0.5 * (y[:-1] + y[1:])
+    y_edges[0] = y[0] - 0.5 * (y[1] - y[0])
+    y_edges[-1] = y[-1] + 0.5 * (y[-1] - y[-2])
+    dy = np.diff(y_edges)
+
+    dx_face = np.empty(nx + 1)
+    dx_face[1:-1] = 0.5 * (dx[:-1] + dx[1:])
+    dx_face[0] = dx[0]
+    dx_face[-1] = dx[-1]
+
+    dy_face = np.empty(ny + 1)
+    dy_face[1:-1] = 0.5 * (dy[:-1] + dy[1:])
+    dy_face[0] = dy[0]
+    dy_face[-1] = dy[-1]
+
+    # Face-centered velocities (MODFLOW-style).
+    vx_face = np.zeros((ny, nx + 1), dtype=float)
+    vy_face = np.zeros((ny + 1, nx), dtype=float)
+
+    # Interior x-faces: between columns j-1 and j.
+    kx_face = hmean(K[:, :-1], K[:, 1:])
+    vx_face[:, 1:nx] = -kx_face * (h[:, 1:] - h[:, :-1]) / dx_face[1:nx]
+    # Boundary x-faces: one-sided approximation from nearest cell centers.
+    vx_face[:, 0] = -K[:, 0] * (h[:, 1] - h[:, 0]) / dx_face[0]
+    vx_face[:, nx] = -K[:, -1] * (h[:, -1] - h[:, -2]) / dx_face[-1]
+
+    # Interior y-faces: between rows i-1 and i.
+    ky_face = hmean(K[:-1, :], K[1:, :])
+    vy_face[1:ny, :] = -ky_face * (h[1:, :] - h[:-1, :]) / dy_face[1:ny, None]
+    # Boundary y-faces: one-sided approximation from nearest cell centers.
+    vy_face[0, :] = -K[0, :] * (h[1, :] - h[0, :]) / dy_face[0]
+    vy_face[ny, :] = -K[-1, :] * (h[-1, :] - h[-2, :]) / dy_face[-1]
+
+    # Align face outputs with MODFLOW budget convention:
+    # - QXX is the flow/velocity at each cell's right face (ny, nx)
+    # - QYY is the flow/velocity at each cell's "front" face (ny, nx)
+    # Using these slices removes the one-cell offset against MT3D/MODFLOW exports.
+    qxx = vx_face[:, 1:]
+    qyy = vy_face[1:, :]
+    # MODFLOW QXX/QYY do not include an external-neighbor exchange on the
+    # outer model edge in these arrays; set those outer faces to zero.
+    qxx[:, -1] = 0.0
+    qyy[-1, :] = 0.0
+
+    if output_location == "face":
+        return qxx, qyy
+
+    # Convert MODFLOW-style per-cell face values to cell-centered values.
+    vx_cell = np.empty((ny, nx), dtype=float)
+    vy_cell = np.empty((ny, nx), dtype=float)
+
+    vx_cell[:, 0] = qxx[:, 0]
+    vx_cell[:, 1:] = 0.5 * (qxx[:, :-1] + qxx[:, 1:])
+
+    vy_cell[0, :] = qyy[0, :]
+    vy_cell[1:, :] = 0.5 * (qyy[:-1, :] + qyy[1:, :])
+    return vx_cell, vy_cell
 
 
 def run_modflow(mf2005_config):
@@ -210,7 +279,9 @@ def run_modflow(mf2005_config):
     dx = mf2005_config['dx']
     dy = mf2005_config['dy']
     dz = mf2005_config['dz']
-    delta_h = mf2005_config['grad_head'] * lx
+    x = np.arange(lx)
+    delta_h = mf2005_config['grad_head'] * np.abs(x[-1] - x[0])
+    # delta_h = mf2005_config['grad_head'] * lx
     model_ws = str(mf2005_config['model_ws'])
     modflow_exe = str(mf2005_config['modflow_exe'])
     model_name = str(mf2005_config['model_name'])
