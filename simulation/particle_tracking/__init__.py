@@ -9,10 +9,10 @@ Use this package as before:
   particle_tracking.gpu_track_particles_arclength(...)
 
 Or import submodules explicitly:
-  from simulation.particle_tracking import cpu, par2, gpu
+  from simulation.particle_tracking import rk45_cpu, par2, rk45_gpu
 """
 
-from .cpu import (
+from .rk45_cpu import (
     find_le_index,
     bilinear_sample,
     norm2,
@@ -21,7 +21,7 @@ from .cpu import (
     particle_tracking_cpu,
 )
 from .par2 import run_par2
-from .gpu import gpu_track_particles_arclength
+from .rk45_gpu import gpu_track_particles_arclength
 from .utils import fastest_trajectory, fastest_trajectory_with_snapshot
 
 __all__ = [

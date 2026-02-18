@@ -100,9 +100,14 @@ def update_config_dict(config_dict, config_update):
             if value is not None:
                 config_dict[key] = value
 
-def create_par2_config(dx, dy, lx, ly, path_mfoutput, path_p2output, source_vertex, x_cp):
-    """Create PAR2 configuration dictionary from grid and path parameters."""
-    return {
+def create_par2_config(dx, dy, lx, ly, path_mfoutput, path_p2output, source_vertex, x_cp, overrides=None):
+    """Create PAR2 configuration dictionary from grid and path parameters.
+
+    Optional overrides: a dict of key-value pairs (nested keys supported) merged into
+    the base config, so any PAR2 YAML key can be adjusted (e.g. simulation.dt,
+    simulation.particles.N, output.debut.num) without changing this function.
+    """
+    config = {
         'grid': {
             'cell size': [dx, dy, 1],
             'dimension': [lx, ly, 1]
@@ -142,6 +147,9 @@ def create_par2_config(dx, dy, lx, ly, path_mfoutput, path_p2output, source_vert
             },
         },
     }
+    if overrides is not None:
+        update_config_dict(config, overrides)
+    return config
 
 
 def create_lazymole_config(lx, ly, dx, dy, path_lminput, path_lmoutput):

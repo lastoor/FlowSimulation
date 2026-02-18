@@ -1,13 +1,21 @@
 """
-Compare fastest paths from PAR2, RK45 CPU, and RK45 GPU.
+Compare the solved fastest path of a velocity field (from log-fBm conductivity) across solvers.
+
+The velocity field is obtained by solving flow on a log-fBm conductivity field with MODFLOW.
+We then compute the fastest path from source to target on that same velocity field using:
+  - PAR2 (external executable)
+  - rk45_cpu (Numba RK45 arclength)
+  - rk45_gpu (Numba CUDA RK45 arclength)
+  - rk4_fp (Taichi RK4 time stepping)
 
 Workflow:
-1) Generate fBm log-K field.
-2) Solve velocity field with MODFLOW.
-3) Run particle tracking: PAR2, RK45 CPU, RK45 GPU.
-4) Compare fastest paths; visualize and save outputs.
+1) Generate log-fBm conductivity field.
+2) Solve velocity field with MODFLOW from that conductivity.
+3) Solve fastest path with PAR2, rk45_cpu, rk45_gpu, rk4_fp on the same velocity field.
+4) Compare and visualize the four fastest paths; save figure and npz.
 """
 
+import argparse
 import os
 import warnings
 from pathlib import Path
@@ -98,10 +106,11 @@ def _save_comparison_figure(
     vy,
     rk45_cpu_res,
     rk45_gpu_res,
+    rk4_fp_res,
     par2_trajs,
     par2_fast,
 ):
-    """Save a figure comparing PAR2, RK45 CPU, and RK45 GPU fastest paths."""
+    """Save a figure comparing PAR2, RK45 CPU/GPU, and RK4 FP fastest paths."""
     log10k_field = logk_field / np.log(10.0)
     ny, nx = vx.shape
     x = np.arange(nx)
@@ -141,13 +150,14 @@ def _save_comparison_figure(
             label="Fastest Path (PAR2)",
         )
 
-    ax.plot(
-        rk45_cpu_res["x"],
-        rk45_cpu_res["y"],
-        "w--",
-        lw=2.0,
-        label=f'Fastest Path (RK45 CPU), t={rk45_cpu_res["travel_time"]:.3g}',
-    )
+    if rk45_cpu_res is not None:
+        ax.plot(
+            rk45_cpu_res["x"],
+            rk45_cpu_res["y"],
+            "w--",
+            lw=2.0,
+            label=f'Fastest Path (RK45 CPU), t={rk45_cpu_res["travel_time"]:.3g}',
+        )
 
     if rk45_gpu_res is not None:
         ax.plot(
@@ -158,7 +168,16 @@ def _save_comparison_figure(
             label=f'Fastest Path (RK45 GPU), t={rk45_gpu_res["travel_time"]:.3g}',
         )
 
-    ax.set_title("Fastest Path Comparison: PAR2 vs RK45 CPU vs RK45 GPU")
+    if rk4_fp_res is not None:
+        ax.plot(
+            rk4_fp_res["x"],
+            rk4_fp_res["y"],
+            "m-",
+            lw=2.0,
+            label=f'Fastest Path (RK4 FP Taichi), t={rk4_fp_res["travel_time"]:.3g}',
+        )
+
+    ax.set_title("Fastest path (velocity from log-fBm conductivity): PAR2 vs RK45 CPU/GPU vs RK4 FP")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_xlim(0, nx - 1)
@@ -169,7 +188,48 @@ def _save_comparison_figure(
     plt.close(fig)
 
 
+def _parse_args():
+    p = argparse.ArgumentParser(
+        description="Compare fastest path from log-fBm conductivity velocity using selected solvers.",
+    )
+    p.add_argument(
+        "--no-par2",
+        action="store_true",
+        help="Do not run PAR2 in the comparison.",
+    )
+    p.add_argument(
+        "--no-rk45-cpu",
+        action="store_true",
+        help="Do not run RK45 CPU in the comparison.",
+    )
+    p.add_argument(
+        "--no-rk45-gpu",
+        action="store_true",
+        help="Do not run RK45 GPU in the comparison.",
+    )
+    p.add_argument(
+        "--no-rk4-fp",
+        action="store_true",
+        help="Do not run RK4 FP (Taichi) in the comparison.",
+    )
+    args = p.parse_args()
+    use_par2 = not args.no_par2
+    use_rk45_cpu = not args.no_rk45_cpu
+    use_rk45_gpu = not args.no_rk45_gpu
+    use_rk4_fp = not args.no_rk4_fp
+    if not (use_par2 or use_rk45_cpu or use_rk45_gpu or use_rk4_fp):
+        p.error("At least one algorithm must be enabled (do not pass all --no-* flags).")
+    return argparse.Namespace(
+        use_par2=use_par2,
+        use_rk45_cpu=use_rk45_cpu,
+        use_rk45_gpu=use_rk45_gpu,
+        use_rk4_fp=use_rk4_fp,
+    )
+
+
 def main():
+    opts = _parse_args()
+
     # --- Paths ---
     path_cwd = Path(__file__).parent.resolve()
     path_out = path_cwd / "compare_output"
@@ -185,7 +245,7 @@ def main():
     path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2")
 
     # --- Domain / fBm parameters ---
-    np.random.seed(547)
+    np.random.seed(544)
     num_pt = 100
     dx = 1.0
     dy = 1.0
@@ -217,6 +277,24 @@ def main():
     ]
     x_cp = target_vertex[0][0]
 
+    # --- Shared comparison parameters (same for PAR2 and Python solvers) ---
+    x0 = float(source_vertex[0][0])
+    y0 = float(source_vertex[0][1])
+    y1 = float(source_vertex[1][1])
+    density_particle = 20
+    nP = max(2, int(density_particle * abs(y1 - y0)))
+    dt_compare = 0.1 * min(dx, dy)
+    max_steps_compare = 200000
+    right_x = float(x_cp)
+    eps_speed = 1e-30
+    ds_min = 1e-20
+    ds_max = 0.5 * min(dx, dy)
+    tol = 1e-4
+    y_policy = "stop"
+    max_points = 100000
+    max_iters = 200000
+    max_traj = 5
+
     # --- MODFLOW ---
     ftl_path = path_mfoutput / "mf2005_model_modified.ftl"
     mf2005_config = {
@@ -240,16 +318,29 @@ def main():
     if "successfully" not in return_msg_mf.lower():
         raise RuntimeError(f"MODFLOW run failed: {return_msg_mf}")
 
-    # --- PAR2 config and run ---
-    update_config_file(
-        str(path_p2input / "par2_config.yaml"),
-        create_par2_config(dx, dy, lx, ly, path_mfoutput, path_p2output, source_vertex, x_cp),
-    )
-    return_code_p2, return_msg_p2 = run_par2(path_par2, path_p2input, path_p2output)
-    print(return_msg_p2)
-    par2_ok = return_code_p2 in (0, 10, 11)
-    if not par2_ok:
-        print("Warning: PAR2 did not succeed (e.g. no GPU). Continuing with RK45 only.")
+    # --- PAR2 config and run (if enabled) ---
+    par2_ok = False
+    if opts.use_par2:
+        par2_overrides = {
+            "simulation": {
+                "particles": {"N": nP},
+                "dt": dt_compare,
+                "steps": max_steps_compare,
+            },
+            "output": {"debut": {"num": max_traj}},
+        }
+        update_config_file(
+            str(path_p2input / "par2_config.yaml"),
+            create_par2_config(
+                dx, dy, lx, ly, path_mfoutput, path_p2output, source_vertex, x_cp,
+                overrides=par2_overrides,
+            ),
+        )
+        return_code_p2, return_msg_p2 = run_par2(path_par2, path_p2input, path_p2output)
+        print(return_msg_p2)
+        par2_ok = return_code_p2 in (0, 10, 11)
+        if not par2_ok:
+            print("Warning: PAR2 did not succeed (e.g. no GPU). Continuing with others.")
 
     # --- Velocity field from MODFLOW output ---
     velocity_field = read_mt3d_file(str(ftl_path))
@@ -258,15 +349,9 @@ def main():
     vx = velocity_field["QXX"]
     vy = velocity_field["QYY"]
 
-    # --- RK45 particle tracking ---
+    # --- Particle tracking (RK45 CPU/GPU, RK4 FP); same params as PAR2 ---
     x_grid = np.arange(vx.shape[1], dtype=np.float32) * np.float32(dx)
     y_grid = np.arange(vx.shape[0], dtype=np.float32) * np.float32(dy)
-
-    x0 = float(source_vertex[0][0])
-    y0 = float(source_vertex[0][1])
-    y1 = float(source_vertex[1][1])
-    density_particle = 20
-    nP = max(2, int(density_particle * abs(y1 - y0)))
     seeds_x = np.full(nP, x0, dtype=np.float32)
     seeds_y = np.linspace(y0, y1, nP).astype(np.float32)
 
@@ -277,58 +362,96 @@ def main():
         "vy": vy,
         "seeds_x": seeds_x,
         "seeds_y": seeds_y,
-        "right_x": float(x_cp),
-        "eps_speed": 1e-30,
-        "ds_min": 1e-20,
-        "ds_max": 0.5 * min(dx, dy),
-        "tol": 1e-4,
-        "y_policy": "stop",
-        "max_points": 4000,
-        "max_iters": 200000,
+        "right_x": right_x,
+        "eps_speed": eps_speed,
+        "ds_min": ds_min,
+        "ds_max": ds_max,
+        "tol": tol,
+        "y_policy": y_policy,
+        "max_points": max_points,
+        "max_iters": max_iters,
+        "dt": dt_compare,
+        "max_steps": max_steps_compare,
     }
-    px, py, pt, L, st = particle_tracking_cpu(args_particle_tracking)
-    rk45_cpu_res = fastest_trajectory(px, py, pt, L, st)
+    rk45_cpu_res = None
+    if opts.use_rk45_cpu:
+        px, py, pt, L, st = particle_tracking_cpu(args_particle_tracking)
+        rk45_cpu_res = fastest_trajectory(px, py, pt, L, st)
 
-    # --- RK45 GPU (optional; skip if no CUDA device) ---
+    # --- RK45 GPU (if enabled; skip if no CUDA device); same config as CPU ---
     rk45_gpu_res = None
-    try:
-        px_g, py_g, pt_g, L_g, st_g, *_ = gpu_track_particles_arclength(
-            x_grid,
-            y_grid,
-            vx,
-            vy,
-            seeds_x,
-            seeds_y,
-            right_x=float(x_cp),
-            eps_speed=1e-30,
-            ds_min=1e-20,
-            ds_max=0.5 * min(dx, dy),
-            tol=1e-4,
-            y_policy="stop",
-            max_points=4000,
-            max_iters=200000,
-        )
-        rk45_gpu_res = fastest_trajectory(px_g, py_g, pt_g, L_g, st_g)
-        print("RK45 GPU fastest path computed.")
-    except Exception as e:
-        print(f"Warning: RK45 GPU skipped ({e}). Continuing with CPU and PAR2 only.")
+    if opts.use_rk45_gpu:
+        try:
+            p = args_particle_tracking
+            px_g, py_g, pt_g, L_g, st_g, *_ = gpu_track_particles_arclength(
+                p["x"],
+                p["y"],
+                p["vx"],
+                p["vy"],
+                p["seeds_x"],
+                p["seeds_y"],
+                right_x=p["right_x"],
+                eps_speed=p["eps_speed"],
+                ds_min=p["ds_min"],
+                ds_max=p["ds_max"],
+                tol=p["tol"],
+                y_policy=p["y_policy"],
+                max_points=p["max_points"],
+                max_iters=p["max_iters"],
+            )
+            rk45_gpu_res = fastest_trajectory(px_g, py_g, pt_g, L_g, st_g)
+            print("RK45 GPU fastest path computed.")
+        except Exception as e:
+            print(f"Warning: RK45 GPU skipped ({e}).")
 
-    # --- PAR2 trajectories (optional if PAR2 failed, e.g. no GPU) ---
-    path_debut = path_p2output / "debut_trajectory"
-    par2_trajs, par2_fast, par2_fast_time = _load_par2_debut_trajectories(path_debut, max_traj=5)
-    if par2_fast is None:
-        par2_fast_time = np.nan
+    # --- RK4 FP Taichi (if enabled; same physical velocity field as RK45) ---
+    rk4_fp_res = None
+    if opts.use_rk4_fp:
+        try:
+            from simulation.particle_tracking.rk4_fp import rk4_fastest_path_params
+
+            rk4_fp_res = rk4_fastest_path_params(args_particle_tracking)
+            print("RK4 FP (Taichi) fastest path computed.")
+        except Exception as e:
+            print(f"Warning: RK4 FP skipped ({e}).")
+
+    # --- PAR2 trajectories (if PAR2 was run) ---
+    par2_trajs = []
+    par2_fast = None
+    par2_fast_time = np.nan
+    if opts.use_par2:
+        path_debut = path_p2output / "debut_trajectory"
+        par2_trajs, par2_fast, par2_fast_time = _load_par2_debut_trajectories(path_debut, max_traj=max_traj)
+        if par2_fast is None:
+            par2_fast_time = np.nan
+
+    # --- Print comparison of solved fastest-path travel times ---
+    print("\n--- Fastest path travel times (same velocity from log-fBm conductivity) ---")
+    if opts.use_par2:
+        print(f"  PAR2:      {par2_fast_time:.6g}" if np.isfinite(par2_fast_time) else "  PAR2:      (not available)")
+    if opts.use_rk45_cpu and rk45_cpu_res is not None:
+        print(f"  RK45 CPU:  {rk45_cpu_res['travel_time']:.6g}")
+    if opts.use_rk45_gpu:
+        print(f"  RK45 GPU:  {rk45_gpu_res['travel_time']:.6g}" if rk45_gpu_res is not None else "  RK45 GPU:  (skipped)")
+    if opts.use_rk4_fp:
+        print(f"  RK4 FP:    {rk4_fp_res['travel_time']:.6g}" if rk4_fp_res is not None else "  RK4 FP:    (skipped)")
+    print("---")
 
     # --- Save compare data ---
     save_kw = {
         "logk_field": logk_field,
         "vx": vx,
         "vy": vy,
-        "rk45_cpu_x": rk45_cpu_res["x"],
-        "rk45_cpu_y": rk45_cpu_res["y"],
-        "rk45_cpu_time": rk45_cpu_res["travel_time"],
         "par2_time": par2_fast_time,
     }
+    if rk45_cpu_res is not None:
+        save_kw["rk45_cpu_x"] = rk45_cpu_res["x"]
+        save_kw["rk45_cpu_y"] = rk45_cpu_res["y"]
+        save_kw["rk45_cpu_time"] = rk45_cpu_res["travel_time"]
+    else:
+        save_kw["rk45_cpu_x"] = np.array([], dtype=np.float64)
+        save_kw["rk45_cpu_y"] = np.array([], dtype=np.float64)
+        save_kw["rk45_cpu_time"] = np.nan
     if rk45_gpu_res is not None:
         save_kw["rk45_gpu_x"] = rk45_gpu_res["x"]
         save_kw["rk45_gpu_y"] = rk45_gpu_res["y"]
@@ -337,6 +460,14 @@ def main():
         save_kw["rk45_gpu_x"] = np.array([], dtype=np.float64)
         save_kw["rk45_gpu_y"] = np.array([], dtype=np.float64)
         save_kw["rk45_gpu_time"] = np.nan
+    if rk4_fp_res is not None:
+        save_kw["rk4_fp_x"] = rk4_fp_res["x"]
+        save_kw["rk4_fp_y"] = rk4_fp_res["y"]
+        save_kw["rk4_fp_time"] = rk4_fp_res["travel_time"]
+    else:
+        save_kw["rk4_fp_x"] = np.array([], dtype=np.float64)
+        save_kw["rk4_fp_y"] = np.array([], dtype=np.float64)
+        save_kw["rk4_fp_time"] = np.nan
     if par2_fast is not None:
         save_kw["par2_x"] = par2_fast[:, 0]
         save_kw["par2_y"] = par2_fast[:, 1]
@@ -346,7 +477,7 @@ def main():
     np.savez(path_out / "compare_par2_rk45_data.npz", **save_kw)
 
     # --- Save figure ---
-    fig_path = path_out / "compare_par2_rk45.png"
+    fig_path = path_out / "compare_par2_rk45_rk4fp.png"
     _save_comparison_figure(
         fig_path,
         logk_field,
@@ -354,6 +485,7 @@ def main():
         vy,
         rk45_cpu_res,
         rk45_gpu_res,
+        rk4_fp_res,
         par2_trajs,
         par2_fast,
     )

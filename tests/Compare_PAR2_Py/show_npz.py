@@ -74,6 +74,10 @@ def main():
         if np.isfinite(t_p2) and "par2_x" in data and data["par2_x"].size > 0:
             ax.plot(data["par2_x"], data["par2_y"], color="#D62728", lw=2, label=f"PAR2 (t={t_p2:.3g})")
 
+        t_rk4 = data.get("rk4_fp_time", np.nan)
+        if np.isfinite(t_rk4) and "rk4_fp_x" in data and data["rk4_fp_x"].size > 0:
+            ax.plot(data["rk4_fp_x"], data["rk4_fp_y"], "m-", lw=2, label=f"RK4 FP (t={t_rk4:.3g})")
+
         ax.set_title("Paths from .npz")
         ax.set_xlabel("x")
         ax.set_ylabel("y")
