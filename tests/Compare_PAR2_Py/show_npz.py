@@ -4,6 +4,7 @@ Load and display data from compare_par2_rk45_data.npz.
 Usage:
   python show_npz.py [path_to.npz] [--plot]
   python show_npz.py [path_to.npz] --snapshots [DIR]   # visualize PAR2 snapshots (default DIR: par2_output/snapshots)
+  python show_npz.py [path_to.npz] --accuracy         # path-velocity alignment (angle vs local velocity)
 """
 
 import argparse
@@ -56,6 +57,78 @@ def _snap_step(name):
     return int(m.group(1)) if m else 0
 
 
+def _bilinear_sample_2d(grid, x, y, ny, nx):
+    """Sample 2D grid at (x, y) with bilinear interpolation. x, y are 1D arrays in [0, nx-1], [0, ny-1]."""
+    x = np.clip(np.asarray(x, dtype=np.float64), 0.0, nx - 1.0 - 1e-10)
+    y = np.clip(np.asarray(y, dtype=np.float64), 0.0, ny - 1.0 - 1e-10)
+    i0 = np.floor(x).astype(np.intp)
+    j0 = np.floor(y).astype(np.intp)
+    i1 = np.minimum(i0 + 1, nx - 1)
+    j1 = np.minimum(j0 + 1, ny - 1)
+    tx = x - i0
+    ty = y - j0
+    v00 = grid[j0, i0]
+    v10 = grid[j0, i1]
+    v01 = grid[j1, i0]
+    v11 = grid[j1, i1]
+    return (1 - tx) * (1 - ty) * v00 + tx * (1 - ty) * v10 + (1 - tx) * ty * v01 + tx * ty * v11
+
+
+def _path_velocity_accuracy(vx, vy, x_path, y_path, eps_speed=1e-30):
+    """
+    Compute angle between path tangent and local velocity at each point.
+
+    Returns mean absolute angle (degrees), RMS angle (degrees), and number of valid points.
+    Skips points where tangent or velocity is zero.
+    """
+    x_path = np.asarray(x_path, dtype=np.float64).ravel()
+    y_path = np.asarray(y_path, dtype=np.float64).ravel()
+    n = len(x_path)
+    if n < 2:
+        return np.nan, np.nan, 0
+
+    ny, nx = vx.shape
+    if vy.shape != (ny, nx):
+        return np.nan, np.nan, 0
+
+    # Tangents: central difference interior, forward/backward at endpoints
+    dx = np.empty(n)
+    dy = np.empty(n)
+    dx[0] = x_path[1] - x_path[0]
+    dy[0] = y_path[1] - y_path[0]
+    if n > 2:
+        dx[1:-1] = x_path[2:] - x_path[:-2]
+        dy[1:-1] = y_path[2:] - y_path[:-2]
+    dx[-1] = x_path[-1] - x_path[-2]
+    dy[-1] = y_path[-1] - y_path[-2]
+
+    t_norm = np.sqrt(dx * dx + dy * dy)
+    valid_t = t_norm > eps_speed
+    if not np.any(valid_t):
+        return np.nan, np.nan, 0
+
+    # Interpolate velocity at path points
+    vx_at = _bilinear_sample_2d(vx, x_path, y_path, ny, nx)
+    vy_at = _bilinear_sample_2d(vy, x_path, y_path, ny, nx)
+    v_norm = np.sqrt(vx_at * vx_at + vy_at * vy_at)
+    valid_v = v_norm > eps_speed
+    valid = valid_t & valid_v
+    if not np.any(valid):
+        return np.nan, np.nan, 0
+
+    tx = np.where(valid_t, dx / t_norm, 0.0)
+    ty = np.where(valid_t, dy / t_norm, 0.0)
+    cos_theta = np.where(valid, (tx * vx_at + ty * vy_at) / (v_norm + 1e-300), np.nan)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta_rad = np.arccos(cos_theta)
+    theta_deg = np.degrees(theta_rad)
+    theta_deg_valid = theta_deg[valid]
+    n_valid = int(np.sum(valid))
+    mean_angle_deg = float(np.mean(np.abs(theta_deg_valid)))
+    rms_angle_deg = float(np.sqrt(np.mean(theta_deg_valid ** 2)))
+    return mean_angle_deg, rms_angle_deg, n_valid
+
+
 def main():
     script_dir = Path(__file__).parent.resolve()
     default_npz = script_dir / "compare_output" / "compare_par2_rk45_data.npz"
@@ -69,6 +142,11 @@ def main():
         const=True,
         default=None,
         help="Visualize PAR2 snapshots from DIR (default: par2_output/snapshots)",
+    )
+    parser.add_argument(
+        "--accuracy",
+        action="store_true",
+        help="Report path-velocity alignment (angle between path tangent and local velocity) for each path.",
     )
     args = parser.parse_args()
 
@@ -88,6 +166,35 @@ def main():
             print(f"  {key}: {_summary(arr)}")
         else:
             print(f"  {key}: shape={arr.shape}, dtype={arr.dtype}, {_summary(arr)}")
+
+    if args.accuracy:
+        if "vx" not in data or "vy" not in data:
+            print("\nSkipping path-velocity accuracy (no vx/vy in npz).")
+        else:
+            vx = data["vx"]
+            vy = data["vy"]
+            if vx.ndim != 2 or vy.shape != vx.shape:
+                print("\nSkipping path-velocity accuracy (vx/vy not 2D or shape mismatch).")
+            else:
+                print("\nPath–velocity alignment (angle between path tangent and local velocity):")
+                path_names = [
+                    ("PAR2", "par2_x", "par2_y"),
+                    ("RK45 CPU", "rk45_cpu_x", "rk45_cpu_y"),
+                    ("RK45 GPU", "rk45_gpu_x", "rk45_gpu_y"),
+                    ("RK4 FP", "rk4_fp_x", "rk4_fp_y"),
+                ]
+                for label, key_x, key_y in path_names:
+                    if key_x not in data or key_y not in data:
+                        continue
+                    x_arr = data[key_x]
+                    y_arr = data[key_y]
+                    if x_arr.size < 2 or y_arr.size < 2:
+                        continue
+                    mean_deg, rms_deg, n_valid = _path_velocity_accuracy(vx, vy, x_arr, y_arr)
+                    if n_valid == 0:
+                        print(f"  {label:10s}: (no valid points)")
+                    else:
+                        print(f"  {label:10s}: mean |θ| = {mean_deg:.2f}°, RMS θ = {rms_deg:.2f}°  (n={n_valid} points)")
 
     if args.plot:
         try:

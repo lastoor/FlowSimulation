@@ -245,7 +245,7 @@ def main():
     path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2")
 
     # --- Domain / fBm parameters ---
-    np.random.seed(5168) #544
+    np.random.seed(687) #544
     num_pt = 100
     dx = 1.0
     dy = 1.0
@@ -437,7 +437,7 @@ def main():
         print(f"  RK4 FP:    {rk4_fp_res['travel_time']:.6g}" if rk4_fp_res is not None else "  RK4 FP:    (skipped)")
     print("---")
 
-    # --- Save compare data ---
+    # --- Save compare data (vx/vy for path-velocity accuracy checks in show_npz.py) ---
     save_kw = {
         "logk_field": logk_field,
         "vx": vx,
