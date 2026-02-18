@@ -109,44 +109,58 @@ def create_par2_config(dx, dy, lx, ly, path_mfoutput, path_p2output, source_vert
     """
     config = {
         'grid': {
-            'cell size': [dx, dy, 1],
-            'dimension': [lx, ly, 1]
+            'cell size': [dx, dy, 1],  # Size of each grid cell in x, y, z directions
+            'dimension': [lx, ly, 1]     # Number of cells in x, y, z directions
         },
         'physics': {
-            'porosity': 0.25,
-            'molecular diffusion': 0.0,
-            'longitudinal dispersivity': 0.0,
-            'transverse dispersivity': 0.0,
+            'porosity': 0.25,                   # Porosity of the medium (fraction of the volume that is void space)
+            'molecular diffusion': 0.0, #1.0e-6,     # Molecular diffusion coefficient
+            'longitudinal dispersivity': 0.0, #0.01,  # Longitudinal dispersivity (how particles spread along the flow direction)
+            'transverse dispersivity': 0.0, #0.001,   # Transverse dispersivity (how particles spread perpendicular to flow)
             'velocity': {
-                'type': 'modflow',
-                'file': str(path_mfoutput / "mf2005_model_modified.ftl"),
+                'type': 'modflow',                       # Type of the velocity data file (Modflow format)
+                'file': str(path_mfoutput / "mf2005_model_modified.ftl"),  # Path to the file containing velocity data
             }
         },
         'simulation': {
             'particles': {
-                'N': 1000,
-                'start': {
-                    'p1': source_vertex[0],
-                    'p2': source_vertex[1]
+                'N': 10000,  # Number of particles to simulate
+                'start': { # Define the volume where the particles are initially located p1x <= x <= p2x, p1y <= y <= p2y, p1z <= z <= p2z
+                    'p1': source_vertex[0],  # Starting position of particles (lower bounds)
+                    'p2': source_vertex[1]   # Ending position of particles (upper bounds)
                 }
             },
-            'dt': 0.2,
-            'steps': 1000000
+            'dt': 0.25,  # Time step size
+            'steps': 100000  # Number of simulation steps to run
         },
         'output': {
             'output_dir': str(path_p2output),
+            # 'csv': {
+            #     'file': './par2_output/result.csv',  # Path to the output CSV file for mc_result
+            #     'skip': 10000,  # Data is computed every 'skip' steps
+            #     'items': [  # List of items to be computed. You can add any number of items here
+            #         {'label': 'cbtx', 'type': 'after-x', 'x': x_cp},  # Compute fraction of particles that have crossed the plane x=x_cp
+            #         # {'label': 'Inside Box', 'type': 'box', 'p1': target_vertex[0], 'p2': target_vertex[1]},  # Compute fraction of particles inside the box
+            #     ]
+            # },
+            'snapshot': {
+                'file': str(path_p2output / 'snapshots/snap_*.csv'),  # Path to the snapshot output files. A file is generated for each output step. Note that exporting a large number of snapshots may slow down the simulation.
+                'skip': 100,  # Save snapshots every 'skip' steps, or use 'steps' to specify exact steps
+                # 'steps': [0, 2500, 5000, 7500, 10000], # List of time steps to save snapshots
+            },
             'debut': {
-                'try_then_run': True,
-                'save_try_traj': False,
-                'save_spatial_moment': False,
-                'traj_file_name': 'traj_*.csv',
-                'skip': 1,
-                'num': 5,
-                'x': x_cp,
-                'interval': 100,
+                'try_then_run': True, # Determine the algorithm to detect debut trajectories. True: Run without saving trajectories, then narrow the release box around the first debut particle, and rerun to detect the approximate debut trajectory. False: Record all trajectories and detect the exact debut trajectory.
+                'save_try_traj': False, # True: Save particle trajectories in the try phase. False: Not initialize traj vectors to hugely save memory.
+                'save_spatial_moment': False, # True: Save spatial moments of particle trajectories in the try phase. 
+                'traj_file_name': 'traj_*.csv',  # Path to the debut output files. A file is generated for each debut trajectory.
+                'skip': 1,  # Data is computed every 'skip' steps
+                'num': 100,  # Number of debut particles to be tracked
+                'x': x_cp,  # X coordinate of the control plane
+                'interval': 100,  # Trajectory export interval from GPU to CPU, in number of time steps
             },
         },
     }
+    
     if overrides is not None:
         update_config_dict(config, overrides)
     return config

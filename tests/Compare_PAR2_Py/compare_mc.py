@@ -1,13 +1,13 @@
 """
-Monte Carlo comparison of PAR2 and RK45 fastest paths.
+Monte Carlo comparison of PAR2 vs Python solvers (RK45 CPU, RK45 GPU, RK4 FP).
 
 Each realization follows the same workflow as compare.py:
 1) Generate fBm log-K field.
 2) Solve flow with MODFLOW.
-3) Track particles with PAR2 and RK45 (CPU).
-4) Measure mismatch between fastest paths using:
-   - symmetric Hausdorff distance,
-   - 2D 1-Wasserstein distance (optimal matching on resampled points).
+3) Track particles with PAR2 and with whichever Python solvers are enabled
+   (RK45 CPU, RK45 GPU, RK4 FP).
+4) Compare PAR2's fastest path to the fastest path among enabled Python solvers
+   (by travel time), using symmetric Hausdorff distance and 2D 1-Wasserstein.
 """
 
 import argparse
@@ -34,6 +34,8 @@ from grf_generation import compute_c, fBmGenerator, generate_logk_field
 from hydraulic import read_mt3d_file, run_modflow
 from par2 import run_par2
 from rk45_cpu import particle_tracking_cpu
+from rk45_gpu import gpu_track_particles_arclength
+from rk4_fp import rk4_fastest_path_params
 from utils import fastest_trajectory
 
 
@@ -145,11 +147,14 @@ def _run_one_realization(
         "modflow_ok": False,
         "par2_ok": False,
         "rk45_time": np.nan,
+        "rk45_gpu_time": np.nan,
+        "rk4_fp_time": np.nan,
         "par2_time": np.nan,
         "hausdorff": np.nan,
         "wasserstein": np.nan,
         "rk45_points": 0,
         "par2_points": 0,
+        "py_best": "",
     }
 
     run_dir = path_root / f"mc_{run_id:04d}"
@@ -194,7 +199,7 @@ def _run_one_realization(
         y1 = float(source_vertex[1][1])
         density_particle = int(args.density_particle)
         nP = max(2, int(density_particle * abs(y1 - y0)))
-        dt_compare = 0.5 * min(dx, dy)
+        dt_compare = 0.1 * min(dx, dy)
         max_steps_compare = 200000
         right_x = float(x_cp)
         eps_speed = 1e-30
@@ -293,6 +298,31 @@ def _run_one_realization(
             rk45_cpu_res = fastest_trajectory(px, py, pt, L, st)
             rec["rk45_time"] = float(rk45_cpu_res["travel_time"])
 
+        rk45_gpu_res = None
+        if args.use_rk45_gpu:
+            try:
+                p = args_particle_tracking
+                px_g, py_g, pt_g, L_g, st_g, *_ = gpu_track_particles_arclength(
+                    p["x"], p["y"], p["vx"], p["vy"],
+                    p["seeds_x"], p["seeds_y"],
+                    right_x=p["right_x"],
+                    eps_speed=p["eps_speed"], ds_min=p["ds_min"], ds_max=p["ds_max"],
+                    tol=p["tol"], y_policy=p["y_policy"],
+                    max_points=p["max_points"], max_iters=p["max_iters"],
+                )
+                rk45_gpu_res = fastest_trajectory(px_g, py_g, pt_g, L_g, st_g)
+                rec["rk45_gpu_time"] = float(rk45_gpu_res["travel_time"])
+            except Exception:
+                pass
+
+        rk4_fp_res = None
+        if args.use_rk4_fp:
+            try:
+                rk4_fp_res = rk4_fastest_path_params(args_particle_tracking)
+                rec["rk4_fp_time"] = float(rk4_fp_res["travel_time"])
+            except Exception:
+                pass
+
         # --- PAR2 fastest (if PAR2 was run) ---
         par2_fast = None
         par2_fast_time = np.nan
@@ -305,27 +335,51 @@ def _run_one_realization(
             rec["error"] = "No valid PAR2 debut trajectory found."
             return rec
 
-        rk45_path = _as_path(rk45_cpu_res["x"], rk45_cpu_res["y"]) if rk45_cpu_res is not None else np.empty((0, 2), dtype=np.float64)
         par2_path = np.asarray(par2_fast, dtype=np.float64)[np.all(np.isfinite(par2_fast), axis=1)] if par2_fast is not None else np.empty((0, 2), dtype=np.float64)
-
-        rec["rk45_points"] = int(rk45_path.shape[0])
         rec["par2_points"] = int(par2_path.shape[0])
 
-        if rk45_path.shape[0] > 0 and par2_path.shape[0] > 0:
-            rec["hausdorff"] = _hausdorff_distance(par2_path, rk45_path)
+        # Best Python path: minimum travel time among enabled solvers
+        candidates = []
+        if rk45_cpu_res is not None:
+            path_cpu = _as_path(rk45_cpu_res["x"], rk45_cpu_res["y"])
+            if path_cpu.shape[0] > 0:
+                candidates.append((float(rk45_cpu_res["travel_time"]), path_cpu, "rk45_cpu"))
+        if rk45_gpu_res is not None:
+            path_gpu = _as_path(rk45_gpu_res["x"], rk45_gpu_res["y"])
+            if path_gpu.shape[0] > 0:
+                candidates.append((float(rk45_gpu_res["travel_time"]), path_gpu, "rk45_gpu"))
+        if rk4_fp_res is not None:
+            path_fp = _as_path(rk4_fp_res["x"], rk4_fp_res["y"])
+            if path_fp.shape[0] > 0:
+                candidates.append((float(rk4_fp_res["travel_time"]), path_fp, "rk4_fp"))
+        if candidates:
+            _time, py_path, py_best = min(candidates, key=lambda c: c[0])
+            rec["py_best"] = py_best
+        else:
+            py_path = np.empty((0, 2), dtype=np.float64)
+        rec["rk45_points"] = int(py_path.shape[0])
+
+        if par2_path.shape[0] > 0 and py_path.shape[0] > 0:
+            rec["hausdorff"] = _hausdorff_distance(par2_path, py_path)
             rec["wasserstein"] = _wasserstein_distance_2d(
                 par2_path,
-                rk45_path,
+                py_path,
                 n_samples=int(args.wasserstein_samples),
             )
         rec["status"] = "ok"
 
         if args.save_run_data:
             save_kw = {"logk_field": logk_field, "vx": vx, "vy": vy}
-            if rk45_path.shape[0] > 0:
-                save_kw["rk45_cpu_x"] = rk45_path[:, 0]
-                save_kw["rk45_cpu_y"] = rk45_path[:, 1]
-                save_kw["rk45_cpu_time"] = rec["rk45_time"]
+            if py_path.shape[0] > 0:
+                save_kw["py_best_x"] = py_path[:, 0]
+                save_kw["py_best_y"] = py_path[:, 1]
+                save_kw["py_best"] = rec["py_best"]
+                if rec["py_best"] == "rk45_cpu":
+                    save_kw["py_best_time"] = rec["rk45_time"]
+                elif rec["py_best"] == "rk45_gpu":
+                    save_kw["py_best_time"] = rec["rk45_gpu_time"]
+                else:
+                    save_kw["py_best_time"] = rec["rk4_fp_time"]
             if par2_path.shape[0] > 0:
                 save_kw["par2_x"] = par2_path[:, 0]
                 save_kw["par2_y"] = par2_path[:, 1]
@@ -352,11 +406,14 @@ def _save_records_csv(path_csv, records):
         "modflow_ok",
         "par2_ok",
         "rk45_time",
+        "rk45_gpu_time",
+        "rk4_fp_time",
         "par2_time",
         "hausdorff",
         "wasserstein",
         "rk45_points",
         "par2_points",
+        "py_best",
     ]
     with open(path_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -415,16 +472,18 @@ def parse_args():
         action="store_true",
         help="Save per-run npz files with fields and trajectories",
     )
-    # Algorithm toggles (same as compare.py); MC only runs PAR2 and RK45 CPU
+    # Algorithm toggles (same as compare.py)
     parser.add_argument("--no-par2", action="store_true", help="Do not run PAR2 in the comparison.")
     parser.add_argument("--no-rk45-cpu", action="store_true", help="Do not run RK45 CPU in the comparison.")
-    parser.add_argument("--no-rk45-gpu", action="store_true", help="Do not run RK45 GPU (ignored in MC).")
-    parser.add_argument("--no-rk4-fp", action="store_true", help="Do not run RK4 FP (ignored in MC).")
+    parser.add_argument("--no-rk45-gpu", action="store_true", help="Do not run RK45 GPU in the comparison.")
+    parser.add_argument("--no-rk4-fp", action="store_true", help="Do not run RK4 FP (Taichi) in the comparison.")
     args = parser.parse_args()
     args.use_par2 = not args.no_par2
     args.use_rk45_cpu = not args.no_rk45_cpu
-    if not (args.use_par2 or args.use_rk45_cpu):
-        parser.error("At least one of PAR2 or RK45 CPU must be enabled (do not pass both --no-par2 and --no-rk45-cpu).")
+    args.use_rk45_gpu = not args.no_rk45_gpu
+    args.use_rk4_fp = not args.no_rk4_fp
+    if not (args.use_par2 or args.use_rk45_cpu or args.use_rk45_gpu or args.use_rk4_fp):
+        parser.error("At least one algorithm must be enabled (do not pass all --no-* flags).")
     return args
 
 
@@ -453,6 +512,10 @@ def main():
         print(f"PAR2 executable: {path_par2}")
     if args.use_rk45_cpu:
         print("RK45 CPU: enabled")
+    if args.use_rk45_gpu:
+        print("RK45 GPU: enabled")
+    if args.use_rk4_fp:
+        print("RK4 FP: enabled")
 
     records = []
     for i in range(args.num_runs):
@@ -494,11 +557,14 @@ def main():
         modflow_ok=np.array([r["modflow_ok"] for r in records], dtype=bool),
         par2_ok=np.array([r["par2_ok"] for r in records], dtype=bool),
         rk45_time=np.array([r["rk45_time"] for r in records], dtype=np.float64),
+        rk45_gpu_time=np.array([r["rk45_gpu_time"] for r in records], dtype=np.float64),
+        rk4_fp_time=np.array([r["rk4_fp_time"] for r in records], dtype=np.float64),
         par2_time=np.array([r["par2_time"] for r in records], dtype=np.float64),
         hausdorff=np.array([r["hausdorff"] for r in records], dtype=np.float64),
         wasserstein=np.array([r["wasserstein"] for r in records], dtype=np.float64),
         rk45_points=np.array([r["rk45_points"] for r in records], dtype=np.int32),
         par2_points=np.array([r["par2_points"] for r in records], dtype=np.int32),
+        py_best=np.array([r["py_best"] for r in records], dtype=object),
         status=np.array([r["status"] for r in records], dtype=str),
     )
 

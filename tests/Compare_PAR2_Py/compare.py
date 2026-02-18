@@ -245,14 +245,14 @@ def main():
     path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2")
 
     # --- Domain / fBm parameters ---
-    np.random.seed(544)
+    np.random.seed(5168) #544
     num_pt = 100
     dx = 1.0
     dy = 1.0
     dz = 1.0
     grad_head = 0.1
     hurst = 0.25
-    std = 2.0
+    std = 3.0
     minpadding = 1
     alpha = hurst * 2.0
     c = compute_c(num_pt, hurst, std)
