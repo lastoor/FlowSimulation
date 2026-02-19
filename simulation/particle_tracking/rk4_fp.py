@@ -144,11 +144,16 @@ class ParticleTracking2D:
         y_policy: str = "stop",
         closed_boundary: bool = True,
         diffusion_sigma: float = 0.0,
+        velocity_location: str = "cell",
+        x_cell_centers: np.ndarray | None = None,
+        y_cell_centers: np.ndarray | None = None,
     ):
         vel_grid = np.asarray(vel_grid, dtype=np.float32)
         if vel_grid.ndim != 3 or vel_grid.shape[2] != 2:
             raise ValueError("vel_grid must have shape (ny, nx, 2).")
         ny, nx = vel_grid.shape[0], vel_grid.shape[1]
+        if velocity_location not in ("cell", "face"):
+            raise ValueError("velocity_location must be 'cell' or 'face'.")
         seeds_x = np.asarray(seeds_x, dtype=np.float32).ravel()
         seeds_y = np.asarray(seeds_y, dtype=np.float32).ravel()
         if seeds_x.size != seeds_y.size:
@@ -169,9 +174,37 @@ class ParticleTracking2D:
         self.closed_boundary = bool(closed_boundary)
         self.diffusion_sigma = float(diffusion_sigma)
         self.y_policy = {"stop": 0, "reflect": 1, "clip": 2}[y_policy]
-
+        self._velocity_location = velocity_location
         self.vel_field = ti.Vector.field(2, dtype=ti.f32, shape=(ny, nx))
         self.vel_field.from_numpy(vel_grid)
+        self._is_cell_centered = ti.field(dtype=ti.i32, shape=())
+        self._is_cell_centered[None] = 1 if velocity_location == "cell" else 0
+        self.x_faces = ti.field(dtype=ti.f32, shape=nx + 1)
+        self.y_faces = ti.field(dtype=ti.f32, shape=ny + 1)
+        if velocity_location == "face":
+            if x_cell_centers is not None and y_cell_centers is not None:
+                x_centers = np.asarray(x_cell_centers, dtype=np.float64).ravel()
+                y_centers = np.asarray(y_cell_centers, dtype=np.float64).ravel()
+                if x_centers.size != nx or y_centers.size != ny:
+                    raise ValueError("x_cell_centers length must be nx; y_cell_centers length must be ny.")
+                x_faces_np = np.empty(nx + 1, dtype=np.float32)
+                x_faces_np[0] = float(x_centers[0]) - 0.5 * (x_centers[1] - x_centers[0])
+                x_faces_np[-1] = float(x_centers[-1]) + 0.5 * (x_centers[-1] - x_centers[-2])
+                x_faces_np[1:nx] = 0.5 * (x_centers[:-1] + x_centers[1:])
+                y_faces_np = np.empty(ny + 1, dtype=np.float32)
+                y_faces_np[0] = float(y_centers[0]) - 0.5 * (y_centers[1] - y_centers[0])
+                y_faces_np[-1] = float(y_centers[-1]) + 0.5 * (y_centers[-1] - y_centers[-2])
+                y_faces_np[1:ny] = 0.5 * (y_centers[:-1] + y_centers[1:])
+            else:
+                x_faces_np = np.linspace(xmin, xmax, nx + 1, dtype=np.float32)
+                y_faces_np = np.linspace(ymin, ymax, ny + 1, dtype=np.float32)
+            self.x_faces.from_numpy(x_faces_np)
+            self.y_faces.from_numpy(y_faces_np)
+            self._x_faces_np = x_faces_np
+            self._y_faces_np = y_faces_np
+        else:
+            self._x_faces_np = None
+            self._y_faces_np = None
         self.pos = ti.Vector.field(2, dtype=ti.f32, shape=self.N)
         self.active = ti.field(dtype=ti.i32, shape=self.N)
         self.elapsed_time = ti.field(dtype=ti.f32, shape=self.N)
@@ -219,6 +252,68 @@ class ParticleTracking2D:
         v11 = self.vel_field[y1, x1]
         return (1.0 - wx) * (1.0 - wy) * v00 + wx * (1.0 - wy) * v10 + (1.0 - wx) * wy * v01 + wx * wy * v11
 
+    @ti.func
+    def _face_interp(self, p):
+        """Coordinate-wise linear interpolation for face-centered field: vx(x), vy(y)."""
+        span_x = self.xmax - self.xmin + 1e-30
+        span_y = self.ymax - self.ymin + 1e-30
+        iy = ti.cast(
+            ti.min(ti.max(0, ti.floor((p.y - self.ymin) / span_y * ti.cast(self.ny - 1, ti.f32))), self.ny - 1),
+            ti.i32,
+        )
+        ix_cell = ti.cast(
+            ti.min(ti.max(0, ti.floor((p.x - self.xmin) / span_x * ti.cast(self.nx - 1, ti.f32))), self.nx - 1),
+            ti.i32,
+        )
+        ix = 0
+        for i in range(self.nx):
+            if self.x_faces[i + 1] <= p.x:
+                ix = i + 1
+            else:
+                break
+        ix = ti.min(ix, self.nx)
+        q_xL = self.vel_field[iy, 0][0]
+        q_xR = self.vel_field[iy, self.nx - 1][0]
+        if ix > 0 and ix < self.nx:
+            q_xL = self.vel_field[iy, ix - 1][0]
+            q_xR = self.vel_field[iy, ix][0]
+        elif ix >= self.nx:
+            q_xL = self.vel_field[iy, self.nx - 1][0]
+            q_xR = q_xL
+        x_L = self.x_faces[ix]
+        x_R = self.x_faces[ti.min(ix + 1, self.nx)]
+        dx_seg = x_R - x_L + 1e-30
+        vx_val = q_xL + (p.x - x_L) / dx_seg * (q_xR - q_xL)
+
+        iy_seg = 0
+        for i in range(self.ny):
+            if self.y_faces[i + 1] <= p.y:
+                iy_seg = i + 1
+            else:
+                break
+        iy_seg = ti.min(iy_seg, self.ny)
+        q_yB = self.vel_field[0, ix_cell][1]
+        q_yT = self.vel_field[self.ny - 1, ix_cell][1]
+        if iy_seg > 0 and iy_seg < self.ny:
+            q_yB = self.vel_field[iy_seg - 1, ix_cell][1]
+            q_yT = self.vel_field[iy_seg, ix_cell][1]
+        elif iy_seg >= self.ny:
+            q_yB = self.vel_field[self.ny - 1, ix_cell][1]
+            q_yT = q_yB
+        y_B = self.y_faces[iy_seg]
+        y_T = self.y_faces[ti.min(iy_seg + 1, self.ny)]
+        dy_seg = y_T - y_B + 1e-30
+        vy_val = q_yB + (p.y - y_B) / dy_seg * (q_yT - q_yB)
+        return ti.Vector([vx_val, vy_val])
+
+    @ti.func
+    def interpolate_velocity(self, p):
+        """Sample velocity at physical position p (cell: bilinear, face: coordinate-wise linear)."""
+        v_cell = self.bilinear_interp(p)
+        v_face = self._face_interp(p)
+        is_cell = self._is_cell_centered[None] == 1
+        return ti.select(is_cell, v_cell, v_face)
+
     @ti.kernel
     def init_particle_state(self):
         """Set active=1, elapsed_time=0, final_times=exit_penalty. (pos already set from host.)"""
@@ -233,10 +328,10 @@ class ParticleTracking2D:
             if self.active[i] == 1:
                 p0 = self.pos[i]
                 t0 = self.elapsed_time[i]
-                k1 = self.bilinear_interp(p0)
-                k2 = self.bilinear_interp(p0 + 0.5 * dt * k1)
-                k3 = self.bilinear_interp(p0 + 0.5 * dt * k2)
-                k4 = self.bilinear_interp(p0 + dt * k3)
+                k1 = self.interpolate_velocity(p0)
+                k2 = self.interpolate_velocity(p0 + 0.5 * dt * k1)
+                k3 = self.interpolate_velocity(p0 + 0.5 * dt * k2)
+                k4 = self.interpolate_velocity(p0 + dt * k3)
                 v_final = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
                 p1 = p0 + v_final * dt
 
@@ -307,6 +402,12 @@ class ParticleTracking2D:
         min_time = float(times_np[winner_idx])
         return winner_idx, min_time, times_np
 
+    def _numpy_interp_physical(self, px: float, py: float, vel_np: np.ndarray):
+        """Interpolate velocity at physical (px, py). vel_np shape (ny, nx, 2). Cell: bilinear; face: coordinate-wise linear."""
+        if self._velocity_location == "cell":
+            return self._numpy_bilinear_interp_physical(px, py, vel_np)
+        return self._numpy_face_interp_physical(px, py, vel_np)
+
     def _numpy_bilinear_interp_physical(self, px: float, py: float, vel_np: np.ndarray):
         """Bilinear interpolation at physical (px, py). vel_np shape (ny, nx, 2)."""
         span_x = self.xmax - self.xmin + 1e-30
@@ -329,6 +430,40 @@ class ParticleTracking2D:
         vy = (1 - wx) * (1 - wy) * v00[1] + wx * (1 - wy) * v10[1] + (1 - wx) * wy * v01[1] + wx * wy * v11[1]
         return np.array([vx, vy], dtype=np.float32)
 
+    def _numpy_face_interp_physical(self, px: float, py: float, vel_np: np.ndarray):
+        """Coordinate-wise linear interpolation for face-centered field. vel_np shape (ny, nx, 2)."""
+        x_faces = self._x_faces_np
+        y_faces = self._y_faces_np
+        span_x = self.xmax - self.xmin + 1e-30
+        span_y = self.ymax - self.ymin + 1e-30
+        iy = int(np.clip(np.floor((py - self.ymin) / span_y * (self.ny - 1)), 0, self.ny - 1))
+        ix_cell = int(np.clip(np.floor((px - self.xmin) / span_x * (self.nx - 1)), 0, self.nx - 1))
+        ix = np.searchsorted(x_faces, px, side="right") - 1
+        ix = max(0, min(ix, self.nx - 1))
+        if ix <= 0:
+            q_xL = vel_np[iy, 0, 0]
+            q_xR = vel_np[iy, 0, 0]
+            x_L, x_R = x_faces[0], x_faces[1]
+        else:
+            q_xL = vel_np[iy, ix - 1, 0]
+            q_xR = vel_np[iy, ix, 0]
+            x_L, x_R = x_faces[ix], x_faces[min(ix + 1, self.nx)]
+        dx_seg = x_R - x_L + 1e-30
+        vx_val = q_xL + (px - x_L) / dx_seg * (q_xR - q_xL)
+        iy_seg = np.searchsorted(y_faces, py, side="right") - 1
+        iy_seg = max(0, min(iy_seg, self.ny - 1))
+        if iy_seg <= 0:
+            q_yB = vel_np[0, ix_cell, 1]
+            q_yT = vel_np[0, ix_cell, 1]
+            y_B, y_T = y_faces[0], y_faces[1]
+        else:
+            q_yB = vel_np[iy_seg - 1, ix_cell, 1]
+            q_yT = vel_np[iy_seg, ix_cell, 1]
+            y_B, y_T = y_faces[iy_seg], y_faces[min(iy_seg + 1, self.ny)]
+        dy_seg = y_T - y_B + 1e-30
+        vy_val = q_yB + (py - y_B) / dy_seg * (q_yT - q_yB)
+        return np.array([vx_val, vy_val], dtype=np.float32)
+
     def replay_winner(self, winner_idx: int):
         path_x, path_y = [], []
         p = np.array([float(self._seeds_x[winner_idx]), float(self._seeds_y[winner_idx])], dtype=np.float32)
@@ -338,7 +473,7 @@ class ParticleTracking2D:
             path_y.append(float(p[1]))
             if p[0] >= self.right_x:
                 break
-            v = self._numpy_bilinear_interp_physical(float(p[0]), float(p[1]), vel_np)
+            v = self._numpy_interp_physical(float(p[0]), float(p[1]), vel_np)
             p1 = p + v * self.dt
             if self.closed_boundary:
                 if p1[0] < self.xmin or p1[0] > self.xmax:
@@ -392,6 +527,7 @@ def rk4_fastest_path_params(params: dict) -> dict:
     exit_penalty = float(params.get("exit_penalty_time", 1e9))
     y_policy = params.get("y_policy", "stop")
     closed = params.get("closed_boundary", True)
+    velocity_location = params.get("velocity_location", "cell")
 
     sim = ParticleTracking2D(
         xmin=xmin,
@@ -408,6 +544,9 @@ def rk4_fastest_path_params(params: dict) -> dict:
         y_policy=y_policy,
         closed_boundary=closed,
         diffusion_sigma=0.0,
+        velocity_location=velocity_location,
+        x_cell_centers=x_unif,
+        y_cell_centers=y_unif,
     )
     winner_idx, min_time, _ = sim.run_pass1()
     if min_time >= exit_penalty * 0.9:
@@ -416,7 +555,11 @@ def rk4_fastest_path_params(params: dict) -> dict:
     return {"particle_id": winner_idx, "travel_time": min_time, "x": path_x, "y": path_y}
 
 
-def rk4_fastest_path(vel_field: np.ndarray, cfg: SimConfig | None = None) -> dict:
+def rk4_fastest_path(
+    vel_field: np.ndarray,
+    cfg: SimConfig | None = None,
+    velocity_location: str = "cell",
+) -> dict:
     """
     Run the Taichi-based RK4 simulation on a normalized [0,1]×[0,1] velocity field.
 
@@ -426,6 +569,8 @@ def rk4_fastest_path(vel_field: np.ndarray, cfg: SimConfig | None = None) -> dic
         Velocity field on a unit square, shape (L, L, 2) with (vx, vy).
     cfg : SimConfig | None
         Configuration. If None, uses SimConfig() defaults.
+    velocity_location : str
+        "cell" for cell-centered (bilinear interp) or "face" for face-centered (coordinate-wise linear).
 
     Returns
     -------
@@ -458,6 +603,7 @@ def rk4_fastest_path(vel_field: np.ndarray, cfg: SimConfig | None = None) -> dic
         y_policy="stop",
         closed_boundary=cfg.closed_boundary,
         diffusion_sigma=cfg.diffusion_sigma,
+        velocity_location=velocity_location,
     )
     winner_idx, min_time, _ = sim.run_pass1()
     if min_time >= cfg.exit_penalty_time * 0.9:

@@ -10,7 +10,6 @@ Usage:
 import argparse
 import re
 from pathlib import Path
-import cmcrameri
 
 import numpy as np
 
@@ -74,7 +73,79 @@ def _bilinear_sample_2d(grid, x, y, ny, nx):
     return (1 - tx) * (1 - ty) * v00 + tx * (1 - ty) * v10 + (1 - tx) * ty * v01 + tx * ty * v11
 
 
-def _path_velocity_accuracy(vx, vy, x_path, y_path, eps_speed=1e-30):
+def _face_sample_vx(vx, x, y):
+    """
+    Coordinate-wise linear sampling for face-centered vx.
+
+    Conventions match rk4_fp.py when given MODFLOW QXX/QYY as (ny, nx):
+    - vx[:, j] is located at the x-face x = j + 0.5 (right face of cell j).
+    - x-extent is [-0.5, nx-0.5] in index-space when cell centers are 0..nx-1.
+    """
+    vx = np.asarray(vx, dtype=np.float64)
+    ny, nx = vx.shape
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    x_faces = np.arange(nx + 1, dtype=np.float64) - 0.5
+    x = np.clip(x, x_faces[0], x_faces[-1] - 1e-10)
+    iy = np.clip(np.floor(y).astype(np.intp), 0, ny - 1)
+
+    seg = np.searchsorted(x_faces, x, side="right") - 1
+    seg = np.clip(seg, 0, nx - 1)
+
+    out = np.empty_like(x, dtype=np.float64)
+    mask0 = seg == 0
+    if np.any(mask0):
+        out[mask0] = vx[iy[mask0], 0]
+    mask1 = ~mask0
+    if np.any(mask1):
+        s = seg[mask1]
+        qL = vx[iy[mask1], s - 1]
+        qR = vx[iy[mask1], s]
+        xL = x_faces[s]
+        xR = x_faces[s + 1]
+        t = (x[mask1] - xL) / (xR - xL + 1e-30)
+        out[mask1] = qL + t * (qR - qL)
+    return out
+
+
+def _face_sample_vy(vy, x, y):
+    """
+    Coordinate-wise linear sampling for face-centered vy.
+
+    Conventions match rk4_fp.py when given MODFLOW QXX/QYY as (ny, nx):
+    - vy[i, :] is located at the y-face y = i + 0.5 (top face of cell i).
+    - y-extent is [-0.5, ny-0.5] in index-space when cell centers are 0..ny-1.
+    """
+    vy = np.asarray(vy, dtype=np.float64)
+    ny, nx = vy.shape
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    y_faces = np.arange(ny + 1, dtype=np.float64) - 0.5
+    y = np.clip(y, y_faces[0], y_faces[-1] - 1e-10)
+    ix = np.clip(np.floor(x).astype(np.intp), 0, nx - 1)
+
+    seg = np.searchsorted(y_faces, y, side="right") - 1
+    seg = np.clip(seg, 0, ny - 1)
+
+    out = np.empty_like(y, dtype=np.float64)
+    mask0 = seg == 0
+    if np.any(mask0):
+        out[mask0] = vy[0, ix[mask0]]
+    mask1 = ~mask0
+    if np.any(mask1):
+        s = seg[mask1]
+        qB = vy[s - 1, ix[mask1]]
+        qT = vy[s, ix[mask1]]
+        yB = y_faces[s]
+        yT = y_faces[s + 1]
+        t = (y[mask1] - yB) / (yT - yB + 1e-30)
+        out[mask1] = qB + t * (qT - qB)
+    return out
+
+
+def _path_velocity_accuracy(vx, vy, x_path, y_path, eps_speed=1e-30, velocity_location="face"):
     """
     Compute angle between path tangent and local velocity at each point.
 
@@ -108,8 +179,14 @@ def _path_velocity_accuracy(vx, vy, x_path, y_path, eps_speed=1e-30):
         return np.nan, np.nan, 0
 
     # Interpolate velocity at path points
-    vx_at = _bilinear_sample_2d(vx, x_path, y_path, ny, nx)
-    vy_at = _bilinear_sample_2d(vy, x_path, y_path, ny, nx)
+    if velocity_location not in ("cell", "face"):
+        raise ValueError("velocity_location must be 'cell' or 'face'")
+    if velocity_location == "cell":
+        vx_at = _bilinear_sample_2d(vx, x_path, y_path, ny, nx)
+        vy_at = _bilinear_sample_2d(vy, x_path, y_path, ny, nx)
+    else:
+        vx_at = _face_sample_vx(vx, x_path, y_path)
+        vy_at = _face_sample_vy(vy, x_path, y_path)
     v_norm = np.sqrt(vx_at * vx_at + vy_at * vy_at)
     valid_v = v_norm > eps_speed
     valid = valid_t & valid_v
@@ -147,6 +224,13 @@ def main():
         "--accuracy",
         action="store_true",
         help="Report path-velocity alignment (angle between path tangent and local velocity) for each path.",
+    )
+    parser.add_argument(
+        "--velocity-location",
+        choices=("cell", "face"),
+        default="face",
+        help="How to interpret stored vx/vy when computing --accuracy: "
+        "'cell' uses bilinear interpolation; 'face' uses coordinate-wise linear interpolation (rk4_fp.py-consistent).",
     )
     args = parser.parse_args()
 
@@ -190,7 +274,13 @@ def main():
                     y_arr = data[key_y]
                     if x_arr.size < 2 or y_arr.size < 2:
                         continue
-                    mean_deg, rms_deg, n_valid = _path_velocity_accuracy(vx, vy, x_arr, y_arr)
+                    mean_deg, rms_deg, n_valid = _path_velocity_accuracy(
+                        vx,
+                        vy,
+                        x_arr,
+                        y_arr,
+                        velocity_location=args.velocity_location,
+                    )
                     if n_valid == 0:
                         print(f"  {label:10s}: (no valid points)")
                     else:
@@ -201,6 +291,11 @@ def main():
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
+            try:
+                import cmcrameri  # optional
+                cmap_logk = cmcrameri.cm.batlow
+            except Exception:
+                cmap_logk = plt.cm.viridis
         except ImportError:
             print("--plot requires matplotlib. Skipping plot.")
             return 0
@@ -210,7 +305,7 @@ def main():
         ny, nx = log10k.shape
 
         fig, ax = plt.subplots(figsize=(8, 8))
-        im = ax.imshow(log10k, origin="lower", cmap=cmcrameri.cm.batlow, aspect="equal")
+        im = ax.imshow(log10k, origin="lower", cmap=cmap_logk, aspect="equal")
         plt.colorbar(im, ax=ax, label="log10 K", fraction=0.046, pad=0.04)
 
         t_cpu = data.get("rk45_cpu_time", np.nan)
@@ -260,7 +355,11 @@ def main():
             else:
                 fig, ax = plt.subplots(figsize=(8, 8))
                 n_snap = len(snap_list)
-                cmap = cmcrameri.cm.batlow.resampled(n_snap+1)
+                try:
+                    import cmcrameri  # optional
+                    cmap = cmcrameri.cm.batlow.resampled(n_snap + 1)
+                except Exception:
+                    cmap = plt.cm.viridis(np.linspace(0.0, 1.0, n_snap + 1))
                 for idx, (step, x, y) in enumerate(snap_list):
                     ax.scatter(x, y, s=10, alpha=1, c=cmap(idx))
                 # Overlay fastest paths from npz on top

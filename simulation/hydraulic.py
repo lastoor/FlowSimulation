@@ -152,7 +152,7 @@ def compute_velocity(K, x, y, h, output_location="face"):
         - "cell": return cell-centered velocity fields (ny, nx) via averaging.
         - "face": return face-centered velocity fields:
           vx -> (ny, nx+1), vy -> (ny+1, nx).
-        Default is "cell".
+        Default is "face".
 
     Returns
     -------

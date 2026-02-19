@@ -245,7 +245,7 @@ def main():
     path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2")
 
     # --- Domain / fBm parameters ---
-    np.random.seed(687) #544
+    np.random.seed(62387671) #544 #6871
     num_pt = 100
     dx = 1.0
     dy = 1.0
@@ -363,6 +363,7 @@ def main():
         "seeds_x": seeds_x,
         "seeds_y": seeds_y,
         "right_x": right_x,
+        "velocity_location": "face",  # QXX/QYY from MODFLOW are face-centered
         "eps_speed": eps_speed,
         "ds_min": ds_min,
         "ds_max": ds_max,
