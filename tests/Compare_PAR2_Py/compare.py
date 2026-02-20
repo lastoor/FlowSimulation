@@ -99,6 +99,204 @@ def _load_par2_debut_trajectories(path_debut, max_traj=5):
     return all_trajs, fastest_traj, fastest_time
 
 
+def _find_existing_file(path_dir, candidates):
+    """Return first existing file in candidates under path_dir, else None."""
+    for name in candidates:
+        p = path_dir / name
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+
+def _first_crossing_path(x, y, t, x_cp):
+    """
+    Clip a trajectory to first x >= x_cp crossing in index coordinates.
+
+    Returns (x_clip, y_clip, t_cross) or (None, None, np.nan) if no crossing.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    if x.size == 0 or y.size != x.size or t.size != x.size:
+        return None, None, np.nan
+
+    hit = np.where(x >= x_cp)[0]
+    if hit.size == 0:
+        return None, None, np.nan
+
+    k = int(hit[0])
+    if k == 0:
+        return x[:1].copy(), y[:1].copy(), float(t[0])
+
+    x0, y0, t0 = x[k - 1], y[k - 1], t[k - 1]
+    x1, y1, t1 = x[k], y[k], t[k]
+    if np.isfinite(x1 - x0) and abs(x1 - x0) > 1e-30:
+        frac = (x_cp - x0) / (x1 - x0)
+        frac = float(np.clip(frac, 0.0, 1.0))
+    else:
+        frac = 1.0
+
+    y_cross = y0 + frac * (y1 - y0)
+    t_cross = t0 + frac * (t1 - t0)
+    x_clip = np.concatenate([x[:k], np.array([x_cp], dtype=np.float64)])
+    y_clip = np.concatenate([y[:k], np.array([y_cross], dtype=np.float64)])
+    return x_clip, y_clip, float(t_cross)
+
+
+def _run_modpath7_and_extract_fastest(path_mp7, path_mfoutput, model_name, x0, y0, y1, nP, x_cp):
+    """
+    Run MODPATH7 with custom seed locations and extract fastest first-x_cp crossing.
+
+    Returns a dict with keys x/y/travel_time or None on failure.
+    """
+    try:
+        import flopy
+    except Exception as e:
+        print(f"Warning: MODPATH skipped (flopy import failed: {e}).")
+        return None
+
+    dis_file = path_mfoutput / f"{model_name}.dis"
+    nam_file = path_mfoutput / f"{model_name}.nam"
+    head_file = _find_existing_file(path_mfoutput, [f"{model_name}.hds", f"{model_name}.hed"])
+    budget_file = _find_existing_file(path_mfoutput, [f"{model_name}.cbc", f"{model_name}.cbb", f"{model_name}.bud"])
+    if head_file is None or budget_file is None or not dis_file.exists() or not nam_file.exists():
+        missing = []
+        if not nam_file.exists():
+            missing.append(str(nam_file))
+        if not dis_file.exists():
+            missing.append(str(dis_file))
+        if head_file is None:
+            missing.append(f"{model_name}.hds/.hed")
+        if budget_file is None:
+            missing.append(f"{model_name}.cbc/.cbb/.bud")
+        print(f"Warning: MODPATH skipped (missing MODFLOW artifacts: {', '.join(missing)}).")
+        return None
+
+    mp_name = f"{model_name}_mp7"
+    try:
+        mf = flopy.modflow.Modflow.load(
+            nam_file.name,
+            model_ws=str(path_mfoutput),
+            check=False,
+            verbose=False,
+            forgive=False,
+        )
+        if mf is None:
+            raise RuntimeError("Failed to load MODFLOW model for MODPATH setup.")
+
+        mp = flopy.modpath.Modpath7(
+            modelname=mp_name,
+            exe_name=str(path_mp7),
+            flowmodel=mf,
+            headfilename=str(head_file),
+            budgetfilename=str(budget_file),
+            model_ws=str(path_mfoutput),
+        )
+
+        flopy.modpath.Modpath7Bas(mp, porosity=0.3)
+
+        # Build seeds matching compare.py coordinates (cell-center index space).
+        sx = np.full(int(nP), float(x0), dtype=np.float64)
+        sy = np.linspace(float(y0), float(y1), int(nP), dtype=np.float64)
+
+        nrow, ncol = mf.nrow, mf.ncol
+        # MP7/MODFLOW rows are top-origin; comparison/plotting here are bottom-origin.
+        x_phys = sx + 0.5
+        y_phys_top = nrow - (sy + 0.5)
+        j0 = np.clip(np.floor(x_phys).astype(np.int64), 0, ncol - 1)
+        i0 = np.clip(np.floor(y_phys_top).astype(np.int64), 0, nrow - 1)
+        xloc0 = np.clip(x_phys - j0, 1e-6, 1.0 - 1e-6).astype(np.float32)
+        yloc0 = np.clip(y_phys_top - i0, 1e-6, 1.0 - 1e-6).astype(np.float32)
+
+        partlocs = [(0, int(ii), int(jj)) for ii, jj in zip(i0.tolist(), j0.tolist())]
+        pdat = flopy.modpath.ParticleData(
+            partlocs=partlocs,
+            structured=True,
+            localx=xloc0,
+            localy=yloc0,
+            localz=np.full(int(nP), 0.5, dtype=np.float32),
+        )
+        pgroup = flopy.modpath.ParticleGroup(
+            particlegroupname="PG1",
+            particledata=pdat,
+        )
+        flopy.modpath.Modpath7Sim(
+            mp,
+            simulationtype="pathline",
+            trackingdirection="forward",
+            weaksinkoption="stop_at",
+            weaksourceoption="stop_at",
+            referencetime=0.0,
+            budgetoutputoption="no",
+            particlegroups=[pgroup],
+        )
+
+        mp.write_name_file()
+        mp.write_input()
+        # Some MP7 binaries require NAME file entries as: KEYWORD UNIT FILE.
+        mpnam_path = path_mfoutput / mp.mpnamefile
+        with open(mpnam_path, "w", encoding="ascii") as f:
+            f.write("# Name file for MODPATH 7 (unit-based entries)\n")
+            f.write(f"MPBAS      86 {mp_name}.mpbas\n")
+            f.write(f"DIS        87 {dis_file.name}\n")
+            f.write(f"HEAD       88 {head_file.name}\n")
+            f.write(f"BUDGET     89 {budget_file.name}\n")
+        ok, buff = mp.run_model(silent=True, report=True)
+        if not ok:
+            msg = "; ".join(buff[-5:]) if isinstance(buff, list) and buff else "unknown MODPATH error"
+            print(f"Warning: MODPATH7 skipped (run failed: {msg}).")
+            return None
+
+        pth_path = path_mfoutput / f"{mp_name}.mppth"
+        if not pth_path.exists():
+            print("Warning: MODPATH7 skipped (pathline file not found).")
+            return None
+        pthobj = flopy.utils.PathlineFile(str(pth_path))
+        rec = pthobj.get_alldata()
+    except Exception as e:
+        print(f"Warning: MODPATH7 skipped ({e}).")
+        return None
+
+    if isinstance(rec, list):
+        rec = np.concatenate([r for r in rec if r is not None and len(r) > 0]) if rec else None
+    if rec is None or len(rec) == 0:
+        print("Warning: MODPATH7 skipped (no pathline records).")
+        return None
+
+    fastest = None
+    fastest_time = np.inf
+    for pid in np.unique(rec["particleid"]):
+        rows = rec[rec["particleid"] == pid]
+        if rows.size < 2:
+            continue
+        order = np.argsort(rows["time"])
+        x = np.asarray(rows["x"][order], dtype=np.float64) - 0.5
+        y = nrow - np.asarray(rows["y"][order], dtype=np.float64) - 0.5
+        t = np.asarray(rows["time"][order], dtype=np.float64)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(t)
+        x, y, t = x[valid], y[valid], t[valid]
+        if x.size < 2:
+            continue
+
+        x_clip, y_clip, t_cross = _first_crossing_path(x, y, t, x_cp=float(x_cp))
+        if x_clip is None or not np.isfinite(t_cross):
+            continue
+        if t_cross < fastest_time:
+            fastest_time = float(t_cross)
+            fastest = {
+                "particle_id": int(pid),
+                "travel_time": float(t_cross),
+                "x": x_clip,
+                "y": y_clip,
+            }
+
+    if fastest is None:
+        print("Warning: MODPATH7 finished but no trajectory crossed x_cp.")
+    else:
+        print("MODPATH7 fastest path computed.")
+    return fastest
+
+
 def _save_comparison_figure(
     path_fig,
     logk_field,
@@ -107,6 +305,7 @@ def _save_comparison_figure(
     rk45_cpu_res,
     rk45_gpu_res,
     rk4_fp_res,
+    modpath_res,
     par2_trajs,
     par2_fast,
 ):
@@ -177,7 +376,16 @@ def _save_comparison_figure(
             label=f'Fastest Path (RK4 FP Taichi), t={rk4_fp_res["travel_time"]:.3g}',
         )
 
-    ax.set_title("Fastest path (velocity from log-fBm conductivity): PAR2 vs RK45 CPU/GPU vs RK4 FP")
+    if modpath_res is not None:
+        ax.plot(
+            modpath_res["x"],
+            modpath_res["y"],
+            color="#FFA500",
+            lw=2.0,
+            label=f'Fastest Path (MODPATH7), t={modpath_res["travel_time"]:.3g}',
+        )
+
+    ax.set_title("Fastest path (velocity from log-fBm conductivity): PAR2 vs RK45 CPU/GPU vs RK4 FP vs MODPATH7")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_xlim(0, nx - 1)
@@ -212,18 +420,25 @@ def _parse_args():
         action="store_true",
         help="Do not run RK4 FP (Taichi) in the comparison.",
     )
+    p.add_argument(
+        "--no-modpath",
+        action="store_true",
+        help="Do not run MODPATH7 in the comparison.",
+    )
     args = p.parse_args()
     use_par2 = not args.no_par2
     use_rk45_cpu = not args.no_rk45_cpu
     use_rk45_gpu = not args.no_rk45_gpu
     use_rk4_fp = not args.no_rk4_fp
-    if not (use_par2 or use_rk45_cpu or use_rk45_gpu or use_rk4_fp):
+    use_modpath = not args.no_modpath
+    if not (use_par2 or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_modpath):
         p.error("At least one algorithm must be enabled (do not pass all --no-* flags).")
     return argparse.Namespace(
         use_par2=use_par2,
         use_rk45_cpu=use_rk45_cpu,
         use_rk45_gpu=use_rk45_gpu,
         use_rk4_fp=use_rk4_fp,
+        use_modpath=use_modpath,
     )
 
 
@@ -243,9 +458,10 @@ def main():
     # --- Executables ---
     path_mf2005 = _resolve_executable("MODFLOW_EXE", "~/bin/mf2005", "MODFLOW")
     path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2")
+    path_mp7 = _resolve_executable("MODPATH_EXE", "~/bin/mp7", "MODPATH7") if opts.use_modpath else None
 
     # --- Domain / fBm parameters ---
-    np.random.seed(62387671) #544 #6871
+    np.random.seed(6238771) #544 #6871
     num_pt = 100
     dx = 1.0
     dy = 1.0
@@ -416,6 +632,20 @@ def main():
         except Exception as e:
             print(f"Warning: RK4 FP skipped ({e}).")
 
+    # --- MODPATH7 fastest path (if enabled; same source segment and crossing x_cp) ---
+    modpath_res = None
+    if opts.use_modpath:
+        modpath_res = _run_modpath7_and_extract_fastest(
+            path_mp7=path_mp7,
+            path_mfoutput=path_mfoutput,
+            model_name="mf2005_model",
+            x0=x0,
+            y0=y0,
+            y1=y1,
+            nP=nP,
+            x_cp=x_cp,
+        )
+
     # --- PAR2 trajectories (if PAR2 was run) ---
     par2_trajs = []
     par2_fast = None
@@ -436,6 +666,8 @@ def main():
         print(f"  RK45 GPU:  {rk45_gpu_res['travel_time']:.6g}" if rk45_gpu_res is not None else "  RK45 GPU:  (skipped)")
     if opts.use_rk4_fp:
         print(f"  RK4 FP:    {rk4_fp_res['travel_time']:.6g}" if rk4_fp_res is not None else "  RK4 FP:    (skipped)")
+    if opts.use_modpath:
+        print(f"  MODPATH7:  {modpath_res['travel_time']:.6g}" if modpath_res is not None else "  MODPATH7:  (skipped)")
     print("---")
 
     # --- Save compare data (vx/vy for path-velocity accuracy checks in show_npz.py) ---
@@ -475,6 +707,14 @@ def main():
     else:
         save_kw["par2_x"] = np.array([], dtype=np.float64)
         save_kw["par2_y"] = np.array([], dtype=np.float64)
+    if modpath_res is not None:
+        save_kw["modpath_x"] = np.asarray(modpath_res["x"], dtype=np.float64)
+        save_kw["modpath_y"] = np.asarray(modpath_res["y"], dtype=np.float64)
+        save_kw["modpath_time"] = float(modpath_res["travel_time"])
+    else:
+        save_kw["modpath_x"] = np.array([], dtype=np.float64)
+        save_kw["modpath_y"] = np.array([], dtype=np.float64)
+        save_kw["modpath_time"] = np.nan
     np.savez(path_out / "compare_par2_rk45_data.npz", **save_kw)
 
     # --- Save figure ---
@@ -487,6 +727,7 @@ def main():
         rk45_cpu_res,
         rk45_gpu_res,
         rk4_fp_res,
+        modpath_res,
         par2_trajs,
         par2_fast,
     )

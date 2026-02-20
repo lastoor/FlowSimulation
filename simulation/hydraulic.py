@@ -312,7 +312,8 @@ def run_modflow(mf2005_config):
     bas = flopy.modflow.ModflowBas(mf, ibound = ibound, strt = strt)
 
     # Add LPF package to the MODFLOW model
-    lpf = flopy.modflow.ModflowLpf(mf, hk = k_field, vka = 1.)
+    # Enable cell-by-cell budget output (ipakcb) for downstream MODPATH runs.
+    lpf = flopy.modflow.ModflowLpf(mf, hk = k_field, vka = 1., ipakcb=53)
 
     # Add OC package to the MODFLOW model
     oc = flopy.modflow.ModflowOc(

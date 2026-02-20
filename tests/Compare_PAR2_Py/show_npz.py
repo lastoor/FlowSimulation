@@ -266,6 +266,7 @@ def main():
                     ("RK45 CPU", "rk45_cpu_x", "rk45_cpu_y"),
                     ("RK45 GPU", "rk45_gpu_x", "rk45_gpu_y"),
                     ("RK4 FP", "rk4_fp_x", "rk4_fp_y"),
+                    ("MODPATH7", "modpath_x", "modpath_y"),
                 ]
                 for label, key_x, key_y in path_names:
                     if key_x not in data or key_y not in data:
@@ -324,6 +325,10 @@ def main():
         if np.isfinite(t_rk4) and "rk4_fp_x" in data and data["rk4_fp_x"].size > 0:
             ax.plot(data["rk4_fp_x"], data["rk4_fp_y"], "m-", lw=2, label=f"RK4 FP (t={t_rk4:.3g})")
 
+        t_mp = data.get("modpath_time", np.nan)
+        if np.isfinite(t_mp) and "modpath_x" in data and data["modpath_x"].size > 0:
+            ax.plot(data["modpath_x"], data["modpath_y"], color="#FFA500", lw=2, label=f"MODPATH7 (t={t_mp:.3g})")
+
         ax.set_title("Paths from .npz")
         ax.set_xlabel("x")
         ax.set_ylabel("y")
@@ -375,6 +380,9 @@ def main():
                 t_rk4 = data.get("rk4_fp_time", np.nan)
                 if np.isfinite(t_rk4) and "rk4_fp_x" in data and data["rk4_fp_x"].size > 0:
                     ax.plot(data["rk4_fp_x"], data["rk4_fp_y"], "m-", lw=2.5, label=f"RK4 FP (t={t_rk4:.3g})")
+                t_mp = data.get("modpath_time", np.nan)
+                if np.isfinite(t_mp) and "modpath_x" in data and data["modpath_x"].size > 0:
+                    ax.plot(data["modpath_x"], data["modpath_y"], color="#FFA500", lw=2.5, label=f"MODPATH7 (t={t_mp:.3g})")
                 all_x = np.concatenate([s[1] for s in snap_list])
                 all_y = np.concatenate([s[2] for s in snap_list])
                 ax.set_xlim(0, data["logk_field"].shape[0])
