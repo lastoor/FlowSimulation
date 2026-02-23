@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from simulation.config import create_par2_config, update_config_file
 from simulation.grf_generation import compute_c, fBmGenerator, generate_logk_field
-from simulation.hydraulic import read_mt3d_file, run_modflow
+from simulation.hydraulic import read_mt3d_file, run_modflow, write_mt3d_file
 from simulation.particle_tracking import (
     fastest_trajectory,
     particle_tracking_cpu,
@@ -299,7 +299,9 @@ def _run_modpath7_and_extract_fastest(path_mp7, path_mfoutput, model_name, x0, y
 
 def _save_comparison_figure(
     path_fig,
-    logk_field,
+    background_field,
+    background_label,
+    title,
     vx,
     vy,
     rk45_cpu_res,
@@ -308,16 +310,16 @@ def _save_comparison_figure(
     modpath_res,
     par2_trajs,
     par2_fast,
+    expected_lane=None,
 ):
     """Save a figure comparing PAR2, RK45 CPU/GPU, and RK4 FP fastest paths."""
-    log10k_field = logk_field / np.log(10.0)
     ny, nx = vx.shape
     x = np.arange(nx)
     y = np.arange(ny)
 
     fig, ax = plt.subplots(figsize=(9, 8))
-    im = ax.imshow(log10k_field, origin="lower", cmap="viridis", aspect="equal")
-    plt.colorbar(im, ax=ax, label="log10 K", fraction=0.046, pad=0.04)
+    im = ax.imshow(background_field, origin="lower", cmap="viridis", aspect="equal")
+    plt.colorbar(im, ax=ax, label=background_label, fraction=0.046, pad=0.04)
 
     ax.streamplot(
         x,
@@ -347,6 +349,16 @@ def _save_comparison_figure(
             color="#D62728",
             lw=2.0,
             label="Fastest Path (PAR2)",
+        )
+
+    if expected_lane is not None:
+        ax.plot(
+            expected_lane[:, 0],
+            expected_lane[:, 1],
+            color="#FFD700",
+            lw=2.0,
+            ls=":",
+            label="Expected fastest lane",
         )
 
     if rk45_cpu_res is not None:
@@ -385,7 +397,7 @@ def _save_comparison_figure(
             label=f'Fastest Path (MODPATH7), t={modpath_res["travel_time"]:.3g}',
         )
 
-    ax.set_title("Fastest path (velocity from log-fBm conductivity): PAR2 vs RK45 CPU/GPU vs RK4 FP vs MODPATH7")
+    ax.set_title(title)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_xlim(0, nx - 1)
@@ -398,7 +410,25 @@ def _save_comparison_figure(
 
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Compare fastest path from log-fBm conductivity velocity using selected solvers.",
+        description="Compare fastest path across solvers on either fbm->MODFLOW or synthetic velocity fields.",
+    )
+    p.add_argument(
+        "--test-case",
+        choices=("fbm", "synthetic", "both"),
+        default="fbm",
+        help="Velocity field source: fbm (default), synthetic, or both.",
+    )
+    p.add_argument(
+        "--synthetic-shape-tol",
+        type=float,
+        default=2.0,
+        help="Max mean nearest-distance (grid cells) to expected fastest lane in synthetic mode.",
+    )
+    p.add_argument(
+        "--synthetic-time-gap-min",
+        type=float,
+        default=5e-3,
+        help="Minimum expected time gap between fastest and second-fastest synthetic lanes.",
     )
     p.add_argument(
         "--no-par2",
@@ -434,6 +464,9 @@ def _parse_args():
     if not (use_par2 or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_modpath):
         p.error("At least one algorithm must be enabled (do not pass all --no-* flags).")
     return argparse.Namespace(
+        test_case=args.test_case,
+        synthetic_shape_tol=float(args.synthetic_shape_tol),
+        synthetic_time_gap_min=float(args.synthetic_time_gap_min),
         use_par2=use_par2,
         use_rk45_cpu=use_rk45_cpu,
         use_rk45_gpu=use_rk45_gpu,
@@ -442,109 +475,218 @@ def _parse_args():
     )
 
 
-def main():
-    opts = _parse_args()
+def _polyline_travel_time(x_path, y_path, vx, vy):
+    """Estimate travel time along a path using local speed magnitude."""
+    x_path = np.asarray(x_path, dtype=np.float64)
+    y_path = np.asarray(y_path, dtype=np.float64)
+    if x_path.size < 2 or y_path.size != x_path.size:
+        return np.inf
 
-    # --- Paths ---
-    path_cwd = Path(__file__).parent.resolve()
-    path_out = path_cwd / "compare_output"
-    path_mfoutput = path_cwd / "mf2005_output"
-    path_p2input = path_cwd / "par2_input"
-    path_p2output = path_cwd / "par2_output"
+    ny, nx = vx.shape
+    xi = np.clip(np.rint(x_path).astype(np.int64), 0, nx - 1)
+    yi = np.clip(np.rint(y_path).astype(np.int64), 0, ny - 1)
+    speed = np.sqrt(vx[yi, xi] ** 2 + vy[yi, xi] ** 2)
+    seg_speed = 0.5 * (speed[:-1] + speed[1:])
+    dx = np.diff(x_path)
+    dy = np.diff(y_path)
+    ds = np.sqrt(dx * dx + dy * dy)
+    return float(np.sum(ds / np.maximum(seg_speed, 1e-12)))
 
-    for p in [path_out, path_mfoutput, path_p2input, path_p2output]:
-        p.mkdir(parents=True, exist_ok=True)
 
-    # --- Executables ---
-    path_mf2005 = _resolve_executable("MODFLOW_EXE", "~/bin/mf2005", "MODFLOW")
-    path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2")
-    path_mp7 = _resolve_executable("MODPATH_EXE", "~/bin/mp7", "MODPATH7") if opts.use_modpath else None
+def _build_synthetic_velocity_field(nx, ny):
+    """
+    Build a deterministic velocity field with one unique fastest sine-like lane.
+    """
+    x = np.arange(nx, dtype=np.float64)
+    y = np.arange(ny, dtype=np.float64)
+    Y = np.broadcast_to(y[:, None], (ny, nx))
 
-    # --- Domain / fBm parameters ---
-    np.random.seed(6238771) #544 #6871
-    num_pt = 100
-    dx = 1.0
-    dy = 1.0
-    dz = 1.0
-    grad_head = 0.1
-    hurst = 0.25
-    std = 3.0
-    minpadding = 1
-    alpha = hurst * 2.0
-    c = compute_c(num_pt, hurst, std)
+    base_vx = 0.04
+    vx = np.full((ny, nx), base_vx, dtype=np.float64)
+    vy = np.zeros((ny, nx), dtype=np.float64)
 
-    fbm_gen = fBmGenerator(c=c, alpha=alpha, num_pt=num_pt, dim=2, minpadding=minpadding)
-    logk_field, msg_k = generate_logk_field(fbm_gen)
-    print(msg_k)
-    if logk_field is None or logk_field.ndim != 2:
-        raise RuntimeError("Failed to generate a valid 2D log-K field.")
-
-    ly, lx = logk_field.shape
-    np.savetxt(path_out / "logk_field.dat", logk_field, delimiter=" ")
-
-    # --- Source / target region setup (same style as simulation/main.py) ---
-    source_vertex = [
-        [lx // 20 - 1, ly // 20 - 1, 0],
-        [lx // 20 - 1, ly - ly // 20 - 1, 1],
+    lanes = [
+        {"name": "lane0", "y0": 0.28 * ny, "amp": 5.5, "freq": 1.2, "phase": 0.2, "boost": 0.05, "width": 2.4},
+        {"name": "lane1", "y0": 0.52 * ny, "amp": 8.0, "freq": 2, "phase": 1.0, "boost": 50, "width": 2.2},
+        {"name": "lane2", "y0": 0.72 * ny, "amp": 4.5, "freq": 0.9, "phase": -0.6, "boost": 0.05, "width": 2.6},
     ]
-    target_vertex = [
-        [lx - lx // 20 - 1, 0, 0],
-        [lx - lx // 20 - 1, ly - 1, 1],
-    ]
-    x_cp = target_vertex[0][0]
 
-    # --- Shared comparison parameters (same for PAR2 and Python solvers) ---
-    x0 = float(source_vertex[0][0])
-    y0 = float(source_vertex[0][1])
-    y1 = float(source_vertex[1][1])
-    density_particle = 20
-    nP = max(2, int(density_particle * abs(y1 - y0)))
-    dt_compare = 0.1 * min(dx, dy)
-    max_steps_compare = 200000
-    right_x = float(x_cp)
-    eps_speed = 1e-30
-    ds_min = 1e-20
-    ds_max = 0.5 * min(dx, dy)
-    tol = 1e-4
-    y_policy = "stop"
-    max_points = 100000
-    max_iters = 200000
-    max_traj = 5
+    lane_paths = []
+    lane_times = []
+    for lane in lanes:
+        phase = (2.0 * np.pi * lane["freq"] * x / nx) + lane["phase"]
+        y_curve = lane["y0"] + lane["amp"] * np.sin(phase)
+        dydx = lane["amp"] * (2.0 * np.pi * lane["freq"] / nx) * np.cos(phase)
+        dist = Y - y_curve[None, :]
+        width = max(float(lane["width"]), 1e-6)
+        weight = np.exp(-0.5 * (dist / width) ** 2)
+        tangent_norm = np.sqrt(1.0 + dydx[None, :] ** 2)
+        vx += weight * (lane["boost"] / tangent_norm)
+        vy += weight * (lane["boost"] * dydx[None, :] / tangent_norm)
 
-    # --- MODFLOW ---
-    ftl_path = path_mfoutput / "mf2005_model_modified.ftl"
-    mf2005_config = {
-        "modflow_exe": str(path_mf2005),
-        "model_ws": str(path_mfoutput),
-        "model_name": "mf2005_model",
-        "outftl_name": str(ftl_path),
-        "grad_head": grad_head,
-        "lx": int(lx),
-        "ly": int(ly),
-        "lz": 1,
-        "dx": dx,
-        "dy": dy,
-        "dz": dz,
-        "logk_field": logk_field,
+        y_curve = np.clip(y_curve, 0.0, ny - 1.0)
+        path = np.column_stack((x, y_curve))
+        lane_paths.append(path)
+        lane_times.append(_polyline_travel_time(path[:, 0], path[:, 1], vx, vy))
+
+    vx = np.maximum(vx, 1e-8)
+    lane_times = np.asarray(lane_times, dtype=np.float64)
+    order = np.argsort(lane_times)
+    fastest_idx = int(order[0])
+    second_idx = int(order[1])
+    expected = {
+        "lane_paths": lane_paths,
+        "lane_times": lane_times,
+        "fastest_lane_id": fastest_idx,
+        "fastest_lane": lane_paths[fastest_idx],
+        "second_fastest_time": float(lane_times[second_idx]),
     }
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ResourceWarning)
-        return_msg_mf = run_modflow(mf2005_config)
-    print(return_msg_mf)
-    if "successfully" not in return_msg_mf.lower():
-        raise RuntimeError(f"MODFLOW run failed: {return_msg_mf}")
+    return vx, vy, expected
 
-    # --- PAR2 config and run (if enabled) ---
+
+def _downsample_path(path, max_points=2000):
+    path = np.asarray(path, dtype=np.float64)
+    if path.ndim != 2 or path.shape[1] != 2:
+        return np.empty((0, 2), dtype=np.float64)
+    if path.shape[0] <= max_points:
+        return path
+    idx = np.linspace(0, path.shape[0] - 1, max_points).astype(np.int64)
+    return path[idx]
+
+
+def _mean_nearest_distance(path_a, path_b):
+    """Mean nearest-neighbor distance from path_a to path_b."""
+    pa = _downsample_path(path_a, max_points=2000)
+    pb = _downsample_path(path_b, max_points=1500)
+    if pa.shape[0] == 0 or pb.shape[0] == 0:
+        return np.inf
+    delta = pa[:, None, :] - pb[None, :, :]
+    d2 = np.sum(delta * delta, axis=2)
+    return float(np.mean(np.sqrt(np.min(d2, axis=1))))
+
+
+def _evaluate_synthetic_solver_results(expected, solver_results, shape_tol, time_gap_min):
+    """Evaluate synthetic-case success by shape proximity and travel time."""
+    fastest_lane = expected["fastest_lane"]
+    fastest_time = float(expected["lane_times"][expected["fastest_lane_id"]])
+    second_fastest_time = float(expected["second_fastest_time"])
+    if (second_fastest_time - fastest_time) <= float(time_gap_min):
+        raise RuntimeError(
+            "Synthetic profile is not uniquely fastest under configured time-gap criterion. "
+            f"gap={second_fastest_time - fastest_time:.6g}, required>{time_gap_min:.6g}"
+        )
+
+    time_upper = fastest_time + max(0.25 * fastest_time, 0.5 * float(time_gap_min))
+    print("\n--- Synthetic validation (shape + time) ---")
+    print(
+        f"  Expected fastest lane: id={expected['fastest_lane_id']}, "
+        f"t*={fastest_time:.6g}, second={second_fastest_time:.6g}, gap={second_fastest_time-fastest_time:.6g}"
+    )
+
+    metrics = {}
+    for solver_name, res in solver_results.items():
+        key = solver_name.lower().replace(" ", "_")
+        if res is None:
+            metrics[f"{key}_shape_error"] = np.nan
+            metrics[f"{key}_time_error"] = np.nan
+            metrics[f"{key}_pass_flag"] = 0
+            print(f"  {solver_name}: (not available)")
+            continue
+
+        path = np.column_stack((np.asarray(res["x"], dtype=np.float64), np.asarray(res["y"], dtype=np.float64)))
+        shape_error = _mean_nearest_distance(path, fastest_lane)
+        travel_time = float(res["travel_time"])
+        time_error = travel_time - fastest_time
+
+        pass_shape = shape_error <= float(shape_tol)
+        pass_time = (travel_time <= (second_fastest_time - float(time_gap_min))) and (travel_time <= time_upper)
+        pass_flag = int(pass_shape and pass_time)
+
+        metrics[f"{key}_shape_error"] = float(shape_error)
+        metrics[f"{key}_time_error"] = float(time_error)
+        metrics[f"{key}_pass_flag"] = pass_flag
+        print(
+            f"  {solver_name}: "
+            f"shape_err={shape_error:.4g} (<= {shape_tol:.4g}: {pass_shape}), "
+            f"time={travel_time:.6g}, dt={time_error:.6g}, pass={bool(pass_flag)}"
+        )
+    print("---")
+    return metrics
+
+
+def _run_case(
+    case_name,
+    opts,
+    path_out,
+    path_mfoutput,
+    path_p2input,
+    path_p2output,
+    path_par2,
+    path_mp7,
+    source_vertex,
+    x_cp,
+    vx,
+    vy,
+    dx,
+    dy,
+    x0,
+    y0,
+    y1,
+    nP,
+    dt_compare,
+    max_steps_compare,
+    right_x,
+    eps_speed,
+    ds_min,
+    ds_max,
+    tol,
+    y_policy,
+    max_points,
+    max_iters,
+    max_traj,
+    background_field,
+    background_label,
+    title,
+    expected_synthetic=None,
+    modpath_model_name=None,
+):
+    ly, lx = vx.shape
+    ftl_path = path_mfoutput / ("mf2005_model_modified.ftl" if case_name == "fbm" else "synthetic_velocity.ftl")
+
+    if case_name == "synthetic":
+        cnh = []
+        for j in range(ly):
+            cnh.append([1, j + 1, 1, 1.0e-2])
+            cnh.append([1, j + 1, lx, 0.0])
+        vars_ftl = {
+            "header": " 'MT3D4.00.00'           0           0           0           0           0           0         200           1           1           0           0           0           0           0           0           0           0           0           0           0           0",
+            "THKSAT": -111.0 * np.ones((ly, lx), dtype=np.float64),
+            "QXX": np.asarray(vx, dtype=np.float64),
+            "QYY": np.asarray(vy, dtype=np.float64),
+            "CNH": np.asarray(cnh, dtype=np.float64),
+        }
+        par2_overrides = {
+            "physics": {
+                "velocity": {
+                    "file": str(ftl_path),
+                },
+            },
+        }
+        write_mt3d_file(str(ftl_path), vars_ftl)
+
     par2_ok = False
     if opts.use_par2:
-        par2_overrides = {
-            "simulation": {
-                "particles": {"N": nP},
-                "dt": dt_compare,
-                "steps": max_steps_compare,
-            },
-            "output": {"debut": {"num": max_traj}},
-        }
+        par2_overrides = par2_overrides if "par2_overrides" in locals() else {}
+        par2_overrides.update(
+            {
+                "simulation": {
+                    "particles": {"N": nP},
+                    "dt": dt_compare,
+                    "steps": max_steps_compare,
+                },
+                "output": {"debut": {"num": max_traj}},
+            }
+        )
         update_config_file(
             str(path_p2input / "par2_config.yaml"),
             create_par2_config(
@@ -558,14 +700,6 @@ def main():
         if not par2_ok:
             print("Warning: PAR2 did not succeed (e.g. no GPU). Continuing with others.")
 
-    # --- Velocity field from MODFLOW output ---
-    velocity_field = read_mt3d_file(str(ftl_path))
-    if "QXX" not in velocity_field or "QYY" not in velocity_field:
-        raise KeyError("FTL file does not contain expected QXX/QYY velocity fields.")
-    vx = velocity_field["QXX"]
-    vy = velocity_field["QYY"]
-
-    # --- Particle tracking (RK45 CPU/GPU, RK4 FP); same params as PAR2 ---
     x_grid = np.arange(vx.shape[1], dtype=np.float32) * np.float32(dx)
     y_grid = np.arange(vx.shape[0], dtype=np.float32) * np.float32(dy)
     seeds_x = np.full(nP, x0, dtype=np.float32)
@@ -574,12 +708,12 @@ def main():
     args_particle_tracking = {
         "x": x_grid,
         "y": y_grid,
-        "vx": vx,
-        "vy": vy,
+        "vx": np.asarray(vx, dtype=np.float64),
+        "vy": np.asarray(vy, dtype=np.float64),
         "seeds_x": seeds_x,
         "seeds_y": seeds_y,
         "right_x": right_x,
-        "velocity_location": "face",  # QXX/QYY from MODFLOW are face-centered
+        "velocity_location": "face",
         "eps_speed": eps_speed,
         "ds_min": ds_min,
         "ds_max": ds_max,
@@ -595,33 +729,34 @@ def main():
         px, py, pt, L, st = particle_tracking_cpu(args_particle_tracking)
         rk45_cpu_res = fastest_trajectory(px, py, pt, L, st)
 
-    # --- RK45 GPU (if enabled; skip if no CUDA device); same config as CPU ---
     rk45_gpu_res = None
     if opts.use_rk45_gpu:
-        try:
-            p = args_particle_tracking
-            px_g, py_g, pt_g, L_g, st_g, *_ = gpu_track_particles_arclength(
-                p["x"],
-                p["y"],
-                p["vx"],
-                p["vy"],
-                p["seeds_x"],
-                p["seeds_y"],
-                right_x=p["right_x"],
-                eps_speed=p["eps_speed"],
-                ds_min=p["ds_min"],
-                ds_max=p["ds_max"],
-                tol=p["tol"],
-                y_policy=p["y_policy"],
-                max_points=p["max_points"],
-                max_iters=p["max_iters"],
-            )
-            rk45_gpu_res = fastest_trajectory(px_g, py_g, pt_g, L_g, st_g)
-            print("RK45 GPU fastest path computed.")
-        except Exception as e:
-            print(f"Warning: RK45 GPU skipped ({e}).")
+        if gpu_track_particles_arclength is None:
+            print("Warning: RK45 GPU skipped (GPU backend unavailable in this environment).")
+        else:
+            try:
+                p = args_particle_tracking
+                px_g, py_g, pt_g, L_g, st_g, *_ = gpu_track_particles_arclength(
+                    p["x"],
+                    p["y"],
+                    p["vx"],
+                    p["vy"],
+                    p["seeds_x"],
+                    p["seeds_y"],
+                    right_x=p["right_x"],
+                    eps_speed=p["eps_speed"],
+                    ds_min=p["ds_min"],
+                    ds_max=p["ds_max"],
+                    tol=p["tol"],
+                    y_policy=p["y_policy"],
+                    max_points=p["max_points"],
+                    max_iters=p["max_iters"],
+                )
+                rk45_gpu_res = fastest_trajectory(px_g, py_g, pt_g, L_g, st_g)
+                print("RK45 GPU fastest path computed.")
+            except Exception as e:
+                print(f"Warning: RK45 GPU skipped ({e}).")
 
-    # --- RK4 FP Taichi (if enabled; same physical velocity field as RK45) ---
     rk4_fp_res = None
     if opts.use_rk4_fp:
         try:
@@ -632,13 +767,12 @@ def main():
         except Exception as e:
             print(f"Warning: RK4 FP skipped ({e}).")
 
-    # --- MODPATH7 fastest path (if enabled; same source segment and crossing x_cp) ---
     modpath_res = None
-    if opts.use_modpath:
+    if opts.use_modpath and modpath_model_name is not None:
         modpath_res = _run_modpath7_and_extract_fastest(
             path_mp7=path_mp7,
             path_mfoutput=path_mfoutput,
-            model_name="mf2005_model",
+            model_name=modpath_model_name,
             x0=x0,
             y0=y0,
             y1=y1,
@@ -646,7 +780,6 @@ def main():
             x_cp=x_cp,
         )
 
-    # --- PAR2 trajectories (if PAR2 was run) ---
     par2_trajs = []
     par2_fast = None
     par2_fast_time = np.nan
@@ -656,8 +789,7 @@ def main():
         if par2_fast is None:
             par2_fast_time = np.nan
 
-    # --- Print comparison of solved fastest-path travel times ---
-    print("\n--- Fastest path travel times (same velocity from log-fBm conductivity) ---")
+    print(f"\n--- Fastest path travel times ({case_name}) ---")
     if opts.use_par2:
         print(f"  PAR2:      {par2_fast_time:.6g}" if np.isfinite(par2_fast_time) else "  PAR2:      (not available)")
     if opts.use_rk45_cpu and rk45_cpu_res is not None:
@@ -666,15 +798,14 @@ def main():
         print(f"  RK45 GPU:  {rk45_gpu_res['travel_time']:.6g}" if rk45_gpu_res is not None else "  RK45 GPU:  (skipped)")
     if opts.use_rk4_fp:
         print(f"  RK4 FP:    {rk4_fp_res['travel_time']:.6g}" if rk4_fp_res is not None else "  RK4 FP:    (skipped)")
-    if opts.use_modpath:
+    if opts.use_modpath and modpath_model_name is not None:
         print(f"  MODPATH7:  {modpath_res['travel_time']:.6g}" if modpath_res is not None else "  MODPATH7:  (skipped)")
     print("---")
 
-    # --- Save compare data (vx/vy for path-velocity accuracy checks in show_npz.py) ---
     save_kw = {
-        "logk_field": logk_field,
-        "vx": vx,
-        "vy": vy,
+        "case_name": np.array([case_name]),
+        "vx": np.asarray(vx, dtype=np.float64),
+        "vy": np.asarray(vy, dtype=np.float64),
         "par2_time": par2_fast_time,
     }
     if rk45_cpu_res is not None:
@@ -715,24 +846,258 @@ def main():
         save_kw["modpath_x"] = np.array([], dtype=np.float64)
         save_kw["modpath_y"] = np.array([], dtype=np.float64)
         save_kw["modpath_time"] = np.nan
-    np.savez(path_out / "compare_par2_rk45_data.npz", **save_kw)
 
-    # --- Save figure ---
-    fig_path = path_out / "compare_par2_rk45_rk4fp.png"
+    if expected_synthetic is not None:
+        expected_lane = expected_synthetic["fastest_lane"]
+        save_kw["synthetic_expected_lane_id"] = expected_synthetic["fastest_lane_id"]
+        save_kw["synthetic_expected_lane_x"] = expected_lane[:, 0]
+        save_kw["synthetic_expected_lane_y"] = expected_lane[:, 1]
+        save_kw["synthetic_lane_times"] = expected_synthetic["lane_times"]
+        save_kw["synthetic_shape_tol"] = float(opts.synthetic_shape_tol)
+        save_kw["synthetic_time_gap_min"] = float(opts.synthetic_time_gap_min)
+        metrics = _evaluate_synthetic_solver_results(
+            expected_synthetic,
+            {
+                "PAR2": None if par2_fast is None else {"x": par2_fast[:, 0], "y": par2_fast[:, 1], "travel_time": par2_fast_time},
+                "RK45 CPU": rk45_cpu_res,
+                "RK45 GPU": rk45_gpu_res,
+                "RK4 FP": rk4_fp_res,
+            },
+            shape_tol=opts.synthetic_shape_tol,
+            time_gap_min=opts.synthetic_time_gap_min,
+        )
+        save_kw.update(metrics)
+    else:
+        expected_lane = None
+
+    npz_path = path_out / f"compare_par2_rk45_data_{case_name}.npz"
+    np.savez(npz_path, **save_kw)
+    if case_name == "fbm":
+        np.savez(path_out / "compare_par2_rk45_data.npz", **save_kw)
+
+    fig_path = path_out / f"compare_par2_rk45_rk4fp_{case_name}.png"
     _save_comparison_figure(
         fig_path,
-        logk_field,
-        vx,
-        vy,
-        rk45_cpu_res,
-        rk45_gpu_res,
-        rk4_fp_res,
-        modpath_res,
-        par2_trajs,
-        par2_fast,
+        background_field=background_field,
+        background_label=background_label,
+        title=title,
+        vx=vx,
+        vy=vy,
+        rk45_cpu_res=rk45_cpu_res,
+        rk45_gpu_res=rk45_gpu_res,
+        rk4_fp_res=rk4_fp_res,
+        modpath_res=modpath_res,
+        par2_trajs=par2_trajs,
+        par2_fast=par2_fast,
+        expected_lane=expected_lane,
     )
+    if case_name == "fbm":
+        _save_comparison_figure(
+            path_out / "compare_par2_rk45_rk4fp.png",
+            background_field=background_field,
+            background_label=background_label,
+            title=title,
+            vx=vx,
+            vy=vy,
+            rk45_cpu_res=rk45_cpu_res,
+            rk45_gpu_res=rk45_gpu_res,
+            rk4_fp_res=rk4_fp_res,
+            modpath_res=modpath_res,
+            par2_trajs=par2_trajs,
+            par2_fast=par2_fast,
+            expected_lane=expected_lane,
+        )
     print(f"Saved figure: {fig_path}")
-    print(f"Saved data: {path_out / 'compare_par2_rk45_data.npz'}")
+    print(f"Saved data: {npz_path}")
+
+
+def main():
+    opts = _parse_args()
+
+    path_cwd = Path(__file__).parent.resolve()
+    path_out = path_cwd / "compare_output"
+    path_mfoutput = path_cwd / "mf2005_output"
+    path_p2input = path_cwd / "par2_input"
+    path_p2output = path_cwd / "par2_output"
+    for p in [path_out, path_mfoutput, path_p2input, path_p2output]:
+        p.mkdir(parents=True, exist_ok=True)
+
+    np.random.seed(6238771)
+    num_pt = 100
+    dx = 1.0
+    dy = 1.0
+    dz = 1.0
+    grad_head = 0.1
+
+    run_fbm = opts.test_case in ("fbm", "both")
+    run_synthetic = opts.test_case in ("synthetic", "both")
+
+    path_mf2005 = _resolve_executable("MODFLOW_EXE", "~/bin/mf2005", "MODFLOW") if run_fbm else None
+    path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2") if opts.use_par2 else None
+    path_mp7 = _resolve_executable("MODPATH_EXE", "~/bin/mp7", "MODPATH7") if (opts.use_modpath and run_fbm) else None
+
+    ly = num_pt
+    lx = num_pt
+    source_vertex = [
+        [lx // 20 - 1, ly // 20 - 1, 0],
+        [lx // 20 - 1, ly - ly // 20 - 1, 1],
+    ]
+    target_vertex = [
+        [lx - lx // 20 - 1, 0, 0],
+        [lx - lx // 20 - 1, ly - 1, 1],
+    ]
+    x_cp = target_vertex[0][0]
+    x0 = float(source_vertex[0][0])
+    y0 = float(source_vertex[0][1])
+    y1 = float(source_vertex[1][1])
+    density_particle = 1000
+    nP = max(2, int(density_particle * abs(y1 - y0)))
+    dt_compare = 0.01 * min(dx, dy)
+    max_steps_compare = 200000
+    right_x = float(x_cp)
+    eps_speed = 1e-30
+    ds_min = 1e-20
+    ds_max = 0.5 * min(dx, dy)
+    tol = 1e-4
+    y_policy = "stop"
+    max_points = 100000
+    max_iters = 200000
+    max_traj = 5
+
+    if run_fbm:
+        hurst = 0.25
+        std = 3.0
+        minpadding = 1
+        alpha = hurst * 2.0
+        c = compute_c(num_pt, hurst, std)
+        fbm_gen = fBmGenerator(c=c, alpha=alpha, num_pt=num_pt, dim=2, minpadding=minpadding)
+        logk_field, msg_k = generate_logk_field(fbm_gen)
+        print(msg_k)
+        if logk_field is None or logk_field.ndim != 2:
+            raise RuntimeError("Failed to generate a valid 2D log-K field.")
+        np.savetxt(path_out / "logk_field.dat", logk_field, delimiter=" ")
+
+        mf2005_config = {
+            "modflow_exe": str(path_mf2005),
+            "model_ws": str(path_mfoutput),
+            "model_name": "mf2005_model",
+            "outftl_name": str(path_mfoutput / "mf2005_model_modified.ftl"),
+            "grad_head": grad_head,
+            "lx": int(logk_field.shape[1]),
+            "ly": int(logk_field.shape[0]),
+            "lz": 1,
+            "dx": dx,
+            "dy": dy,
+            "dz": dz,
+            "logk_field": logk_field,
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            return_msg_mf = run_modflow(mf2005_config)
+        print(return_msg_mf)
+        if "successfully" not in return_msg_mf.lower():
+            raise RuntimeError(f"MODFLOW run failed: {return_msg_mf}")
+
+        velocity_field = read_mt3d_file(str(path_mfoutput / "mf2005_model_modified.ftl"))
+        if "QXX" not in velocity_field or "QYY" not in velocity_field:
+            raise KeyError("FTL file does not contain expected QXX/QYY velocity fields.")
+        vx_fbm = velocity_field["QXX"]
+        vy_fbm = velocity_field["QYY"]
+
+        _run_case(
+            case_name="fbm",
+            opts=opts,
+            path_out=path_out,
+            path_mfoutput=path_mfoutput,
+            path_p2input=path_p2input,
+            path_p2output=path_p2output,
+            path_par2=path_par2,
+            path_mp7=path_mp7,
+            source_vertex=source_vertex,
+            x_cp=x_cp,
+            vx=vx_fbm,
+            vy=vy_fbm,
+            dx=dx,
+            dy=dy,
+            x0=x0,
+            y0=y0,
+            y1=y1,
+            nP=nP,
+            dt_compare=dt_compare,
+            max_steps_compare=max_steps_compare,
+            right_x=right_x,
+            eps_speed=eps_speed,
+            ds_min=ds_min,
+            ds_max=ds_max,
+            tol=tol,
+            y_policy=y_policy,
+            max_points=max_points,
+            max_iters=max_iters,
+            max_traj=max_traj,
+            background_field=logk_field / np.log(10.0),
+            background_label="log10 K",
+            title="Fastest path (velocity from log-fBm conductivity): PAR2 vs RK45 CPU/GPU vs RK4 FP vs MODPATH7",
+            expected_synthetic=None,
+            modpath_model_name="mf2005_model",
+        )
+
+    if run_synthetic:
+        vx_syn, vy_syn, expected = _build_synthetic_velocity_field(nx=lx, ny=ly)
+        if (expected["second_fastest_time"] - expected["lane_times"][expected["fastest_lane_id"]]) <= opts.synthetic_time_gap_min:
+            raise RuntimeError(
+                "Synthetic field does not satisfy unique fastest lane under current --synthetic-time-gap-min."
+            )
+    
+        ftl_path = path_mfoutput / "synthetic_velocity.ftl"
+        cnh = []
+        for j in range(ly):
+            cnh.append([1, j + 1, 1, 1.0e-2])
+            cnh.append([1, j + 1, lx, 0.0])
+        vars_ftl = {
+            "header": " 'MT3D4.00.00'           0           0           0           0           0           0         200           1           1           0           0           0           0           0           0           0           0           0           0           0           0",
+            "THKSAT": -111.0 * np.ones((ly, lx), dtype=np.float64),
+            "QXX": np.asarray(vx_syn, dtype=np.float64),
+            "QYY": np.asarray(vy_syn, dtype=np.float64),
+            "CNH": np.asarray(cnh, dtype=np.float64),
+        }
+        write_mt3d_file(str(ftl_path), vars_ftl)
+
+        _run_case(
+            case_name="synthetic",
+            opts=opts,
+            path_out=path_out,
+            path_mfoutput=path_mfoutput,
+            path_p2input=path_p2input,
+            path_p2output=path_p2output,
+            path_par2=path_par2,
+            path_mp7=path_mp7,
+            source_vertex=source_vertex,
+            x_cp=x_cp,
+            vx=vx_syn,
+            vy=vy_syn,
+            dx=dx,
+            dy=dy,
+            x0=x0,
+            y0=y0,
+            y1=y1,
+            nP=nP,
+            dt_compare=dt_compare,
+            max_steps_compare=max_steps_compare,
+            right_x=right_x,
+            eps_speed=eps_speed,
+            ds_min=ds_min,
+            ds_max=ds_max,
+            tol=tol,
+            y_policy=y_policy,
+            max_points=max_points,
+            max_iters=max_iters,
+            max_traj=max_traj,
+            background_field=np.sqrt(vx_syn * vx_syn + vy_syn * vy_syn),
+            background_label="|v|",
+            title="Fastest path on synthetic velocity field: PAR2 vs RK45 CPU/GPU vs RK4 FP",
+            expected_synthetic=expected,
+            modpath_model_name=None,
+        )
 
 
 if __name__ == "__main__":

@@ -114,9 +114,9 @@ def create_par2_config(dx, dy, lx, ly, path_mfoutput, path_p2output, source_vert
         },
         'physics': {
             'porosity': 0.25,                   # Porosity of the medium (fraction of the volume that is void space)
-            'molecular diffusion': 1.0e-6,     # Molecular diffusion coefficient
-            'longitudinal dispersivity': 0.01,  # Longitudinal dispersivity (how particles spread along the flow direction)
-            'transverse dispersivity': 0.001,   # Transverse dispersivity (how particles spread perpendicular to flow)
+            'molecular diffusion': 0.0, #1.0e-6,     # Molecular diffusion coefficient
+            'longitudinal dispersivity': 0.0, #0.01,  # Longitudinal dispersivity (how particles spread along the flow direction)
+            'transverse dispersivity': 0.0, #0.001,   # Transverse dispersivity (how particles spread perpendicular to flow)
             'velocity': {
                 'type': 'modflow',                       # Type of the velocity data file (Modflow format)
                 'file': str(path_mfoutput / "mf2005_model_modified.ftl"),  # Path to the file containing velocity data

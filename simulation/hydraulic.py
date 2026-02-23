@@ -360,7 +360,8 @@ def read_mt3d_file(filepath):
     variables = {}
     with open(filepath, 'r') as f:
         # Read the main header line and the next line of integers
-        main_header = f.readline().strip()
+        # Preserve leading spaces (some `.ftl` headers start with a space + quote).
+        main_header = f.readline().rstrip("\r\n")
         _ = f.readline().strip().split() # Read and discard the integer line
 
         variables['header'] = main_header
@@ -421,7 +422,12 @@ def read_mt3d_file(filepath):
         else:
             raise ValueError(f"Failed to parse CNH header line: {var_header_line}")
 
-        _ = f.readline()
+        # Some writers insert an extra "dimension-like" integer line after the CNH header.
+        # The MODFLOW LMT-formatted example in this repo does not; handle both.
+        last_pos = f.tell()
+        maybe_stub = f.readline()
+        if maybe_stub and not re.match(r'^\s*(\d+\s+){4}\d+\s*$', maybe_stub):
+            f.seek(last_pos)
 
         # --- FIX IS HERE ---
         cnh_data = []
@@ -450,3 +456,67 @@ def read_mt3d_file(filepath):
         # --- END OF FIX ---
 
     return variables
+
+def write_mt3d_file(filepath, variables):
+    """
+    Write a MODFLOW/MT3D-style formatted `.ftl` file from in-memory arrays.
+
+    Expected keys in `variables`:
+    - `header`: the full first header line (string)
+    - `THKSAT`, `QXX`, `QYY`: 2D arrays of shape (nrow, ncol)
+    - `CNH`: array-like of shape (nrec, 4) with columns (i, j, k, head)
+
+    Notes:
+    - Uses fixed-width numeric fields with whitespace so `read_mt3d_file` can parse via `.split()`.
+    - Does not insert an extra line after the CNH header (matches the example `.ftl` files in `tests/`).
+    """
+
+    required = ("header", "THKSAT", "QXX", "QYY", "CNH")
+    missing = [k for k in required if k not in variables]
+    if missing:
+        raise KeyError(f"write_mt3d_file missing keys: {missing}")
+
+    thksat = np.asarray(variables["THKSAT"])
+    qxx = np.asarray(variables["QXX"])
+    qyy = np.asarray(variables["QYY"])
+    if thksat.ndim != 2:
+        raise ValueError("THKSAT must be a 2D array")
+    if qxx.shape != thksat.shape or qyy.shape != thksat.shape:
+        raise ValueError("QXX/QYY must have the same shape as THKSAT")
+
+    nrow, ncol = thksat.shape
+
+    with open(filepath, "w") as f:
+        # ① Global header
+        f.write(f"{variables['header']}\n")
+
+        def write_dim_line():
+            # Match common LMT formatted output alignment (5 integers).
+            f.write(f"{1:12d}{1:12d}{nrow:12d}{ncol:12d}{1:12d}\n")
+
+        def write_2d_block(name, arr, fmt, per_line=10):
+            write_dim_line()
+            f.write(f" '{name:<16}'\n")
+
+            flat = np.asarray(arr, dtype=float).ravel(order="C")
+            for start in range(0, flat.size, int(per_line)):
+                chunk = flat[start:start + int(per_line)]
+                # Trailing space guarantees token separation even for edge-case wide values.
+                f.write("".join((fmt.format(val) + " ") for val in chunk).rstrip() + "\n")
+
+        # ③ Variable blocks
+        write_2d_block("THKSAT", thksat, "{:15.6f}")
+        write_2d_block("QXX", qxx, "{:15.8E}")
+        write_2d_block("QYY", qyy, "{:15.8E}")
+
+        # CNH block
+        CNH = np.asarray(variables["CNH"])
+        if CNH.ndim != 2 or CNH.shape[1] < 4:
+            raise ValueError("CNH must be a 2D array with at least 4 columns: (i, j, k, head)")
+        nrec = int(CNH.shape[0])
+        write_dim_line()
+        f.write(f" 'CNH             ' {nrec:10d}\n")
+
+        for rec in CNH[:nrec]:
+            i, j, k, head = int(rec[0]), int(rec[1]), int(rec[2]), float(rec[3])
+            f.write(f"{i:12d}{j:12d}{k:12d} {head:15.8E}\n")

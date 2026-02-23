@@ -21,8 +21,15 @@ from .rk45_cpu import (
     particle_tracking_cpu,
 )
 from .par2 import run_par2
-from .rk45_gpu import gpu_track_particles_arclength
 from .utils import fastest_trajectory, fastest_trajectory_with_snapshot
+
+try:
+    # Numba's CUDA import can fail at import time if a driver isn't present/configured.
+    from .rk45_gpu import gpu_track_particles_arclength  # noqa: F401
+    _gpu_available = True
+except Exception:
+    gpu_track_particles_arclength = None
+    _gpu_available = False
 
 __all__ = [
     "find_le_index",
@@ -34,5 +41,7 @@ __all__ = [
     "fastest_trajectory",
     "fastest_trajectory_with_snapshot",
     "run_par2",
-    "gpu_track_particles_arclength",
 ]
+
+if _gpu_available:
+    __all__.append("gpu_track_particles_arclength")

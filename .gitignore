@@ -48,5 +48,3 @@ tests/Compare_PAR2_Py/mf2005_output/
 tests/Parcels/traj.zarr
 tests/Parcels/particle_tracking_stream.png
 mpath7.log
-tests/Parcels/traj.zarr/
-tests/Parcels/particle_tracking_stream.png

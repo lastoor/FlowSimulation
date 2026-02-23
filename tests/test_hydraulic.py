@@ -7,6 +7,8 @@ import sys
 import os
 import unittest
 import numpy as np
+import tempfile
+from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -25,6 +27,37 @@ from simulation import hydraulic
 
 class TestHydraulic(unittest.TestCase):
     """Test hydraulic functions."""
+
+    def test_mt3d_read_write_roundtrip(self):
+        """write_mt3d_file output is parseable by read_mt3d_file."""
+        variables = {
+            "header": " 'MT3D4.00.00'           0           0           0           0           0",
+            "THKSAT": np.array([[1.0, 2.5, -3.0], [4.0, 5.0, 6.0]], dtype=float),
+            "QXX": np.array([[0.0, 1e-3, -2e-3], [3.0, -4.0, 5.5]], dtype=float),
+            "QYY": np.array([[9.0, 8.0, 7.0], [6.0, 5.0, 4.0]], dtype=float),
+            "CNH": np.array(
+                [
+                    [1, 1, 1, 1.25e-2],
+                    [1, 3, 1, -2.5],
+                ],
+                dtype=float,
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path_ftl = Path(tmpdir) / "roundtrip.ftl"
+            hydraulic.write_mt3d_file(str(path_ftl), variables)
+            parsed = hydraulic.read_mt3d_file(str(path_ftl))
+
+        self.assertEqual(parsed["header"], variables["header"])
+        np.testing.assert_allclose(parsed["THKSAT"], variables["THKSAT"], rtol=0, atol=0)
+        np.testing.assert_allclose(parsed["QXX"], variables["QXX"], rtol=1e-12, atol=0)
+        np.testing.assert_allclose(parsed["QYY"], variables["QYY"], rtol=1e-12, atol=0)
+
+        # CNH parsed dtype may be float due to mixed columns; compare columns explicitly.
+        self.assertEqual(parsed["CNH"].shape[0], variables["CNH"].shape[0])
+        np.testing.assert_array_equal(parsed["CNH"][:, :3].astype(int), variables["CNH"][:, :3].astype(int))
+        np.testing.assert_allclose(parsed["CNH"][:, 3], variables["CNH"][:, 3], rtol=1e-12, atol=0)
 
     def test_compute_velocity_uniform(self):
         """Test velocity computation for uniform head field."""
