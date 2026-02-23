@@ -1,0 +1,1 @@
+Update ./log.md and ../README.md after each meaningful changes. 

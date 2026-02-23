@@ -1,0 +1,1 @@
+Read ./agent/guide.md first. If any conflict, ./agent/guide.md wins.

@@ -952,7 +952,7 @@ def main():
     y1 = float(source_vertex[1][1])
     density_particle = 1000
     nP = max(2, int(density_particle * abs(y1 - y0)))
-    dt_compare = 0.01 * min(dx, dy)
+    dt_compare = 0.001 * min(dx, dy)
     max_steps_compare = 200000
     right_x = float(x_cp)
     eps_speed = 1e-30
