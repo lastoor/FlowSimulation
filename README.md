@@ -8,8 +8,8 @@ FlowSimulation is a Python-based workflow for 2D flow simulation and trajectory 
 - Computes face-centered Darcy velocity fields
 - Computes least-resistance paths (LRP) with Dijkstra
 - Computes fastest paths (FP) with particle tracking:
-  - RK4 on GPU workers (Taichi)
-  - CPU RK45 fallback
+  - RK4 FP (Taichi) with cell/face velocity interpretation
+  - RK45 on CPU/GPU with cell/face velocity interpretation
 - Runs Monte Carlo simulations in parallel across CPUs and GPUs
 
 ## Repository structure
@@ -80,3 +80,13 @@ Per-MC file:
 ## Notes
 - If GPU RK4 tracking fails on a realization, the workflow falls back to CPU RK45 tracking.
 - PETSc solve failures or invalid trajectories trigger retry logic up to `--num_trial`.
+
+## Velocity Field Location Convention
+- `velocity_location="cell"`: `vx`/`vy` are treated as cell-centered and interpolated bilinearly.
+- `velocity_location="face"`: `vx`/`vy` are treated with coordinate-wise face interpolation (`vx` along x-faces, `vy` along y-faces), consistent with `simulation/particle_tracking/rk4_fp.py`.
+- In face mode, `x` and `y` are interpreted as cell-center coordinates; face coordinates are derived by midpoint/extrapolation.
+- RK45 optional face-mode inputs:
+  - `x_cell_centers`
+  - `y_cell_centers`
+  - if omitted, RK45 uses `x` and `y` as the center arrays.
+- Backward compatibility: default remains `velocity_location="cell"`, so existing callers continue to work without changes.

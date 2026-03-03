@@ -6,6 +6,17 @@ import math
 import numpy as np
 from numba import cuda, float32
 
+
+def _build_faces_from_centers(centers):
+    centers = np.asarray(centers, dtype=np.float32).ravel()
+    if centers.size < 2:
+        raise ValueError("center coordinates must contain at least 2 values.")
+    faces = np.empty(centers.size + 1, dtype=np.float32)
+    faces[1:-1] = 0.5 * (centers[:-1] + centers[1:])
+    faces[0] = centers[0] - 0.5 * (centers[1] - centers[0])
+    faces[-1] = centers[-1] + 0.5 * (centers[-1] - centers[-2])
+    return faces
+
 # =========================
 # Device-side helpers
 # =========================
@@ -69,15 +80,74 @@ def bilinear_sample(xgrid, ygrid, vx, vy, nx, ny, x, y, out_v):
 
 
 @cuda.jit(device=True, inline=True)
+def _center_cell_index(grid, n, val):
+    if val <= grid[0]:
+        return 0
+    if val >= grid[n - 1]:
+        return n - 1
+    return find_le_index(grid, n, val)
+
+
+@cuda.jit(device=True, inline=True)
+def face_sample(xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, x, y, out_v):
+    iy = _center_cell_index(ygrid, ny, y)
+    ix_cell = _center_cell_index(xgrid, nx, x)
+
+    if x <= x_faces[0]:
+        ix = 0
+    elif x >= x_faces[nx]:
+        ix = nx - 1
+    else:
+        ix = find_le_index(x_faces, nx + 1, x)
+
+    if ix <= 0:
+        q_xL = vx[iy * nx]
+        q_xR = q_xL
+        x_L, x_R = x_faces[0], x_faces[1]
+    else:
+        q_xL = vx[iy * nx + (ix - 1)]
+        q_xR = vx[iy * nx + ix]
+        x_L, x_R = x_faces[ix], x_faces[ix + 1]
+    dx_seg = x_R - x_L + 1e-30
+    vx_val = q_xL + (x - x_L) / dx_seg * (q_xR - q_xL)
+
+    if y <= y_faces[0]:
+        iy_seg = 0
+    elif y >= y_faces[ny]:
+        iy_seg = ny - 1
+    else:
+        iy_seg = find_le_index(y_faces, ny + 1, y)
+
+    if iy_seg <= 0:
+        q_yB = vy[ix_cell]
+        q_yT = q_yB
+        y_B, y_T = y_faces[0], y_faces[1]
+    else:
+        q_yB = vy[(iy_seg - 1) * nx + ix_cell]
+        q_yT = vy[iy_seg * nx + ix_cell]
+        y_B, y_T = y_faces[iy_seg], y_faces[iy_seg + 1]
+    dy_seg = y_T - y_B + 1e-30
+    vy_val = q_yB + (y - y_B) / dy_seg * (q_yT - q_yB)
+
+    out_v[0] = vx_val
+    out_v[1] = vy_val
+
+
+@cuda.jit(device=True, inline=True)
 def norm2(x, y):
     return math.sqrt(x * x + y * y)
 
 
 @cuda.jit(device=True)
-def rhs_arclength(x, y, xgrid, ygrid, vx, vy, nx, ny, eps_speed, out_rhs, out_speed):
+def rhs_arclength(
+    x, y, xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, velocity_mode, eps_speed, out_rhs, out_speed
+):
     """For z=[x,y,t], dz/ds = [vx/|v|, vy/|v|, 1/|v|]."""
     v = cuda.local.array(2, dtype=float32)
-    bilinear_sample(xgrid, ygrid, vx, vy, nx, ny, x, y, v)
+    if velocity_mode == 0:
+        bilinear_sample(xgrid, ygrid, vx, vy, nx, ny, x, y, v)
+    else:
+        face_sample(xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, x, y, v)
     sp = norm2(v[0], v[1])
     if not math.isfinite(sp) or sp < eps_speed:
         out_rhs[0] = 0.0
@@ -120,6 +190,7 @@ def _get_rk45_device_arrays():
 @cuda.jit
 def rk45_arclength_kernel(
     xgrid, ygrid, vx, vy, nx, ny,
+    x_faces, y_faces, velocity_mode,
     seeds_x, seeds_y,
     right_x, xmin, xmax, ymin, ymax,
     eps_speed, ds_min, ds_max, tol,
@@ -192,7 +263,9 @@ def rk45_arclength_kernel(
         if ds > ds_max:
             ds = ds_max
 
-        rhs_arclength(x, y, xgrid, ygrid, vx, vy, nx, ny, eps_speed, rhs, spv)
+        rhs_arclength(
+            x, y, xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, velocity_mode, eps_speed, rhs, spv
+        )
         sp = spv[0]
         if not math.isfinite(sp) or sp < eps_speed:
             st = 1
@@ -206,7 +279,9 @@ def rk45_arclength_kernel(
                 xi += ds * a * kx[j]
                 yi += ds * a * ky[j]
                 ti += ds * a * kt[j]
-            rhs_arclength(xi, yi, xgrid, ygrid, vx, vy, nx, ny, eps_speed, rhs, spv)
+            rhs_arclength(
+                xi, yi, xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, velocity_mode, eps_speed, rhs, spv
+            )
             kx[s], ky[s], kt[s] = rhs[0], rhs[1], rhs[2]
 
         x5, y5, t5 = x, y, t
@@ -290,6 +365,8 @@ def gpu_track_particles_arclength(
     y_policy="stop",
     max_points=2000, max_iters=200000,
     threads_per_block=256, stream=None, dtype=np.float32,
+    velocity_location="cell",
+    x_cell_centers=None, y_cell_centers=None,
 ):
     """
     Run RK45 particle tracking on GPU. Returns (paths_x, paths_y, paths_t,
@@ -303,6 +380,22 @@ def gpu_track_particles_arclength(
     seeds_y = np.asarray(seeds_y, dtype=dtype)
 
     ny, nx = vx.shape
+    if xgrid.size != nx or ygrid.size != ny:
+        raise ValueError("xgrid/ygrid lengths must match vx/vy shape.")
+    if velocity_location not in ("cell", "face"):
+        raise ValueError("velocity_location must be 'cell' or 'face'.")
+    velocity_mode = np.int32(0 if velocity_location == "cell" else 1)
+    if velocity_mode == 1:
+        x_centers = np.asarray(x_cell_centers if x_cell_centers is not None else xgrid, dtype=dtype).ravel()
+        y_centers = np.asarray(y_cell_centers if y_cell_centers is not None else ygrid, dtype=dtype).ravel()
+        if x_centers.size != nx or y_centers.size != ny:
+            raise ValueError("x_cell_centers length must be nx; y_cell_centers length must be ny.")
+    else:
+        x_centers = xgrid
+        y_centers = ygrid
+    x_faces = _build_faces_from_centers(x_centers).astype(dtype, copy=False)
+    y_faces = _build_faces_from_centers(y_centers).astype(dtype, copy=False)
+
     xmin, xmax = float(xgrid.min()), float(xgrid.max())
     ymin, ymax = float(ygrid.min()), float(ygrid.max())
     if right_x is None:
@@ -312,6 +405,8 @@ def gpu_track_particles_arclength(
     d_ygrid = cuda.to_device(ygrid)
     d_vx = cuda.to_device(vx.ravel())
     d_vy = cuda.to_device(vy.ravel())
+    d_x_faces = cuda.to_device(x_faces)
+    d_y_faces = cuda.to_device(y_faces)
     d_seeds_x = cuda.to_device(seeds_x)
     d_seeds_y = cuda.to_device(seeds_y)
 
@@ -332,6 +427,7 @@ def gpu_track_particles_arclength(
     rk45_arclength_kernel[blocks, threads_per_block, stream](
         d_xgrid, d_ygrid,
         d_vx, d_vy, np.int32(nx), np.int32(ny),
+        d_x_faces, d_y_faces, velocity_mode,
         d_seeds_x, d_seeds_y,
         dtype(right_x), dtype(xmin), dtype(xmax), dtype(ymin), dtype(ymax),
         dtype(eps_speed), dtype(ds_min), dtype(ds_max), dtype(tol),
@@ -347,4 +443,3 @@ def gpu_track_particles_arclength(
         lengths.copy_to_host(), status.copy_to_host(),
         info_code.copy_to_host(), info_value.copy_to_host(), info_speed.copy_to_host(),
     )
-

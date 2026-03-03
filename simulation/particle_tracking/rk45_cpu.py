@@ -7,6 +7,17 @@ import numpy as np
 from numba import njit
 
 
+def _build_faces_from_centers(centers):
+    centers = np.asarray(centers, dtype=np.float32).ravel()
+    if centers.size < 2:
+        raise ValueError("center coordinates must contain at least 2 values.")
+    faces = np.empty(centers.size + 1, dtype=np.float32)
+    faces[1:-1] = 0.5 * (centers[:-1] + centers[1:])
+    faces[0] = centers[0] - 0.5 * (centers[1] - centers[0])
+    faces[-1] = centers[-1] + 0.5 * (centers[-1] - centers[-2])
+    return faces
+
+
 @njit(inline='always')
 def find_le_index(arr, val):
     n = arr.size
@@ -59,6 +70,58 @@ def bilinear_sample(xgrid, ygrid, vx, vy, nx, ny, x, y):
     return vx0 + ty*(vx1 - vx0), vy0 + ty*(vy1 - vy0)
 
 
+@njit(inline='always')
+def _center_cell_index(grid, n, val):
+    if val <= grid[0]:
+        return 0
+    if val >= grid[n - 1]:
+        return n - 1
+    return find_le_index(grid, val)
+
+
+@njit(inline='always')
+def face_sample(xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, x, y):
+    iy = _center_cell_index(ygrid, ny, y)
+    ix_cell = _center_cell_index(xgrid, nx, x)
+
+    if x <= x_faces[0]:
+        ix = 0
+    elif x >= x_faces[nx]:
+        ix = nx - 1
+    else:
+        ix = find_le_index(x_faces, x)
+
+    if ix <= 0:
+        q_xL = vx[iy * nx]
+        q_xR = q_xL
+        x_L, x_R = x_faces[0], x_faces[1]
+    else:
+        q_xL = vx[iy * nx + (ix - 1)]
+        q_xR = vx[iy * nx + ix]
+        x_L, x_R = x_faces[ix], x_faces[ix + 1]
+    dx_seg = x_R - x_L + 1e-30
+    vx_val = q_xL + (x - x_L) / dx_seg * (q_xR - q_xL)
+
+    if y <= y_faces[0]:
+        iy_seg = 0
+    elif y >= y_faces[ny]:
+        iy_seg = ny - 1
+    else:
+        iy_seg = find_le_index(y_faces, y)
+
+    if iy_seg <= 0:
+        q_yB = vy[ix_cell]
+        q_yT = q_yB
+        y_B, y_T = y_faces[0], y_faces[1]
+    else:
+        q_yB = vy[(iy_seg - 1) * nx + ix_cell]
+        q_yT = vy[iy_seg * nx + ix_cell]
+        y_B, y_T = y_faces[iy_seg], y_faces[iy_seg + 1]
+    dy_seg = y_T - y_B + 1e-30
+    vy_val = q_yB + (y - y_B) / dy_seg * (q_yT - q_yB)
+    return vx_val, vy_val
+
+
 @njit
 def norm2(v0, v1):
     """Simple L2 norm function."""
@@ -66,12 +129,15 @@ def norm2(v0, v1):
 
 
 @njit
-def rhs_arclength(x, y, xgrid, ygrid, vx, vy, nx, ny, eps_speed):
+def _rhs_arclength_mode(x, y, xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, velocity_mode, eps_speed):
     """
     For z=[x,y,t], dz/ds = [vx/|v|, vy/|v|, 1/|v|].
     Runs on a single CPU thread.
     """
-    vx_at_p, vy_at_p = bilinear_sample(xgrid, ygrid, vx, vy, nx, ny, x, y)
+    if velocity_mode == 0:
+        vx_at_p, vy_at_p = bilinear_sample(xgrid, ygrid, vx, vy, nx, ny, x, y)
+    else:
+        vx_at_p, vy_at_p = face_sample(xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, x, y)
     sp = norm2(vx_at_p, vy_at_p)
 
     if not math.isfinite(sp) or sp < eps_speed:
@@ -86,14 +152,16 @@ def rhs_arclength(x, y, xgrid, ygrid, vx, vy, nx, ny, eps_speed):
 
 
 @njit
-def rk45_one_particle(xgrid, ygrid,
-                      vx, vy, nx, ny,
-                      x0, y0,
-                      right_x, xmin, xmax, ymin, ymax,
-                      eps_speed, ds_min, ds_max, tol,
-                      y_policy,
-                      max_points, max_iters,
-                      A, B5, B4):
+def _rk45_one_particle_mode(xgrid, ygrid,
+                            x_faces, y_faces,
+                            vx, vy, nx, ny,
+                            x0, y0,
+                            right_x, xmin, xmax, ymin, ymax,
+                            velocity_mode,
+                            eps_speed, ds_min, ds_max, tol,
+                            y_policy,
+                            max_points, max_iters,
+                            A, B5, B4):
     """
     Returns: x_path, y_path, t_path, length, status
     """
@@ -147,8 +215,10 @@ def rk45_one_particle(xgrid, ygrid,
         kt = np.zeros(7, np.float32)
 
         # Stage k1
-        kx[0], ky[0], kt[0], sp = rhs_arclength(x, y, xgrid, ygrid,
-                                                vx, vy, nx, ny, eps_speed)
+        kx[0], ky[0], kt[0], sp = _rhs_arclength_mode(
+            x, y, xgrid, ygrid, x_faces, y_faces,
+            vx, vy, nx, ny, velocity_mode, eps_speed
+        )
         if sp < eps_speed or not math.isfinite(sp):
             st = 1
             break
@@ -161,8 +231,10 @@ def rk45_one_particle(xgrid, ygrid,
                 yi += ds * A[s,j] * ky[j]
                 ti += ds * A[s,j] * kt[j]
 
-            kx[s], ky[s], kt[s], _ = rhs_arclength(xi, yi, xgrid, ygrid,
-                                                   vx, vy, nx, ny, eps_speed)
+            kx[s], ky[s], kt[s], _ = _rhs_arclength_mode(
+                xi, yi, xgrid, ygrid, x_faces, y_faces,
+                vx, vy, nx, ny, velocity_mode, eps_speed
+            )
 
         # 5th order solution
         x5, y5, t5 = x, y, t
@@ -214,6 +286,33 @@ def rk45_one_particle(xgrid, ygrid,
     return x_path, y_path, t_path, count, st
 
 
+@njit
+def rhs_arclength(x, y, xgrid, ygrid, vx, vy, nx, ny, eps_speed):
+    return _rhs_arclength_mode(x, y, xgrid, ygrid, xgrid, ygrid, vx, vy, nx, ny, 0, eps_speed)
+
+
+@njit
+def rk45_one_particle(xgrid, ygrid,
+                      vx, vy, nx, ny,
+                      x0, y0,
+                      right_x, xmin, xmax, ymin, ymax,
+                      eps_speed, ds_min, ds_max, tol,
+                      y_policy,
+                      max_points, max_iters,
+                      A, B5, B4):
+    return _rk45_one_particle_mode(
+        xgrid, ygrid, xgrid, ygrid,
+        vx, vy, nx, ny,
+        x0, y0,
+        right_x, xmin, xmax, ymin, ymax,
+        0,
+        eps_speed, ds_min, ds_max, tol,
+        y_policy,
+        max_points, max_iters,
+        A, B5, B4
+    )
+
+
 def particle_tracking_cpu(params):
     x = params["x"].astype(np.float32)
     y = params["y"].astype(np.float32)
@@ -224,8 +323,25 @@ def particle_tracking_cpu(params):
 
     nx = vx.shape[1]
     ny = vx.shape[0]
+    if x.size != nx or y.size != ny:
+        raise ValueError("x/y lengths must match vx/vy shape.")
     vx_flat = vx.ravel()
     vy_flat = vy.ravel()
+
+    velocity_location = params.get("velocity_location", "cell")
+    if velocity_location not in ("cell", "face"):
+        raise ValueError("velocity_location must be 'cell' or 'face'.")
+    velocity_mode = 0 if velocity_location == "cell" else 1
+    if velocity_mode == 1:
+        x_centers = np.asarray(params.get("x_cell_centers", x), dtype=np.float32).ravel()
+        y_centers = np.asarray(params.get("y_cell_centers", y), dtype=np.float32).ravel()
+        if x_centers.size != nx or y_centers.size != ny:
+            raise ValueError("x_cell_centers length must be nx; y_cell_centers length must be ny.")
+        x_faces = _build_faces_from_centers(x_centers)
+        y_faces = _build_faces_from_centers(y_centers)
+    else:
+        x_faces = _build_faces_from_centers(x)
+        y_faces = _build_faces_from_centers(y)
 
     right_x = params.get("right_x", x[-1])
     eps_speed = params.get("eps_speed", 1e-16)
@@ -259,10 +375,11 @@ def particle_tracking_cpu(params):
     status  = np.zeros(nP, np.int32)
 
     for i in range(nP):
-        xp, yp, tp, L, st = rk45_one_particle(
-            x, y, vx_flat, vy_flat, nx, ny,
+        xp, yp, tp, L, st = _rk45_one_particle_mode(
+            x, y, x_faces, y_faces, vx_flat, vy_flat, nx, ny,
             seeds_x[i], seeds_y[i],
             right_x, xmin, xmax, ymin, ymax,
+            velocity_mode,
             eps_speed, ds_min, ds_max, tol,
             y_policy,
             max_points, max_iters,
@@ -275,5 +392,3 @@ def particle_tracking_cpu(params):
         status[i] = st
 
     return paths_x, paths_y, paths_t, lengths, status
-
-

@@ -950,7 +950,7 @@ def main():
     x0 = float(source_vertex[0][0])
     y0 = float(source_vertex[0][1])
     y1 = float(source_vertex[1][1])
-    density_particle = 1000
+    density_particle = 10
     nP = max(2, int(density_particle * abs(y1 - y0)))
     dt_compare = 0.001 * min(dx, dy)
     max_steps_compare = 200000

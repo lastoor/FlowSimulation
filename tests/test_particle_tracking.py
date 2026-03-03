@@ -208,6 +208,69 @@ class TestParticleTracking(unittest.TestCase):
         # Only initial point recorded
         self.assertEqual(L[0], 1)
 
+    def test_particle_tracking_cpu_face_velocity_uniform_flow(self):
+        """Face-centered mode should advect particles rightward under uniform vx."""
+        nx, ny = 10, 10
+        x = np.linspace(0, 9, nx, dtype=np.float32)
+        y = np.linspace(0, 9, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+
+        nP = 3
+        seeds_x = np.full(nP, x[0], dtype=np.float32)
+        seeds_y = np.linspace(y[0], y[-1], nP, dtype=np.float32)
+
+        params = {
+            'x': x,
+            'y': y,
+            'vx': vx,
+            'vy': vy,
+            'seeds_x': seeds_x,
+            'seeds_y': seeds_y,
+            'right_x': x[-1],
+            'velocity_location': 'face',
+            'x_cell_centers': x,
+            'y_cell_centers': y,
+            'eps_speed': 1e-16,
+            'ds_min': 1e-5,
+            'ds_max': 0.5,
+            'tol': 1e-4,
+            'y_policy': 'stop',
+            'max_points': 2000,
+            'max_iters': 200000,
+            'dtype': np.float64
+        }
+
+        px, py, pt, L, st = particle_tracking.particle_tracking_cpu(params)
+
+        self.assertTrue(np.all(st == 0))
+        self.assertTrue(np.all(L > 1))
+        for i in range(nP):
+            self.assertAlmostEqual(px[i, L[i]-1], x[-1], delta=0.2)
+            self.assertAlmostEqual(py[i, 0], py[i, L[i]-1], delta=0.01)
+
+    def test_particle_tracking_cpu_invalid_velocity_location(self):
+        nx, ny = 5, 5
+        x = np.linspace(0, 4, nx, dtype=np.float32)
+        y = np.linspace(0, 4, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+        seeds_x = np.array([x[0]], dtype=np.float32)
+        seeds_y = np.array([y[0]], dtype=np.float32)
+
+        params = {
+            'x': x,
+            'y': y,
+            'vx': vx,
+            'vy': vy,
+            'seeds_x': seeds_x,
+            'seeds_y': seeds_y,
+            'right_x': x[-1],
+            'velocity_location': 'bad_mode',
+        }
+        with self.assertRaises(ValueError):
+            particle_tracking.particle_tracking_cpu(params)
+
 
 if __name__ == '__main__':
     unittest.main()
