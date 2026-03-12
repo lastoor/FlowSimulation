@@ -16,6 +16,7 @@ def test_imports():
     import simulation.path_finding
     import simulation.config
     import simulation.main
+    assert hasattr(simulation.particle_tracking, "particle_tracking_pollock")
     print("All imports successful.")
 
 if __name__ == '__main__':

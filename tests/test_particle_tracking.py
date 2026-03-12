@@ -249,6 +249,42 @@ class TestParticleTracking(unittest.TestCase):
             self.assertAlmostEqual(px[i, L[i]-1], x[-1], delta=0.2)
             self.assertAlmostEqual(py[i, 0], py[i, L[i]-1], delta=0.01)
 
+    def test_particle_tracking_cpu_crossing_interpolates_to_right_boundary(self):
+        """Accepted steps that overshoot right_x should be clipped to the crossing point."""
+        nx, ny = 10, 4
+        x = np.linspace(0, 0.9, nx, dtype=np.float32)
+        y = np.linspace(0, 0.3, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+        seeds_x = np.array([x[0]], dtype=np.float32)
+        seeds_y = np.array([y[1]], dtype=np.float32)
+        right_x = 0.05
+
+        params = {
+            'x': x,
+            'y': y,
+            'vx': vx,
+            'vy': vy,
+            'seeds_x': seeds_x,
+            'seeds_y': seeds_y,
+            'right_x': right_x,
+            'eps_speed': 1e-16,
+            'ds_min': 1e-5,
+            'ds_max': 0.5,
+            'tol': 1e-4,
+            'y_policy': 'stop',
+            'max_points': 2000,
+            'max_iters': 200000,
+            'dtype': np.float64
+        }
+
+        px, py, pt, L, st = particle_tracking.particle_tracking_cpu(params)
+
+        self.assertEqual(st[0], 0)
+        self.assertAlmostEqual(px[0, L[0] - 1], right_x, delta=1e-5)
+        self.assertAlmostEqual(py[0, L[0] - 1], seeds_y[0], delta=1e-5)
+        self.assertAlmostEqual(pt[0, L[0] - 1], right_x - seeds_x[0], delta=5e-4)
+
     def test_particle_tracking_cpu_invalid_velocity_location(self):
         nx, ny = 5, 5
         x = np.linspace(0, 4, nx, dtype=np.float32)
@@ -270,6 +306,131 @@ class TestParticleTracking(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             particle_tracking.particle_tracking_cpu(params)
+
+    def test_pollock_step_uniform_flow_exits_right_face(self):
+        x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 3), dtype=np.float32)
+        vy = np.zeros((3, 2), dtype=np.float32)
+
+        x_new, y_new, dt, st = particle_tracking.pollock_step(
+            0.25, 0.5, x_faces, y_faces, vx, vy
+        )
+
+        self.assertEqual(st, 0)
+        self.assertAlmostEqual(x_new, 1.0, places=6)
+        self.assertAlmostEqual(y_new, 0.5, places=6)
+        self.assertAlmostEqual(dt, 0.75, places=6)
+
+    def test_trace_pathline_uniform_flow(self):
+        x_faces = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 4), dtype=np.float32)
+        vy = np.zeros((3, 3), dtype=np.float32)
+
+        path, times, st = particle_tracking.trace_pathline(
+            0.25, 0.5, x_faces, y_faces, vx, vy, max_steps=8
+        )
+
+        self.assertEqual(st, 0)
+        self.assertGreaterEqual(path.shape[0], 2)
+        self.assertTrue(np.all(np.diff(path[:, 0]) >= -1e-6))
+        self.assertTrue(np.allclose(path[:, 1], 0.5, atol=1e-6))
+        self.assertTrue(np.all(np.diff(times) >= -1e-6))
+        self.assertAlmostEqual(path[-1, 0], x_faces[-1], places=6)
+        self.assertAlmostEqual(times[-1], 2.75, places=6)
+
+    def test_particle_tracking_pollock_uniform_flow(self):
+        x_faces = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 4), dtype=np.float32)
+        vy = np.zeros((3, 3), dtype=np.float32)
+        seeds_x = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        seeds_y = np.array([0.25, 1.0, 1.75], dtype=np.float32)
+
+        params = {
+            "x_faces": x_faces,
+            "y_faces": y_faces,
+            "vx": vx,
+            "vy": vy,
+            "seeds_x": seeds_x,
+            "seeds_y": seeds_y,
+            "right_x": x_faces[-1],
+            "max_points": 16,
+            "max_steps": 16,
+        }
+
+        px, py, pt, L, st = particle_tracking.particle_tracking_pollock(params)
+
+        self.assertTrue(np.all(st == 0))
+        self.assertTrue(np.all(L > 1))
+        for i in range(seeds_x.size):
+            self.assertAlmostEqual(px[i, L[i] - 1], x_faces[-1], places=6)
+            self.assertAlmostEqual(py[i, 0], py[i, L[i] - 1], places=6)
+            self.assertAlmostEqual(pt[i, L[i] - 1], x_faces[-1] - seeds_x[i], places=6)
+
+    def test_particle_tracking_pollock_zero_velocity_stagnates(self):
+        x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.zeros((2, 3), dtype=np.float32)
+        vy = np.zeros((3, 2), dtype=np.float32)
+
+        params = {
+            "x_faces": x_faces,
+            "y_faces": y_faces,
+            "vx": vx,
+            "vy": vy,
+            "seeds_x": np.array([0.5], dtype=np.float32),
+            "seeds_y": np.array([0.5], dtype=np.float32),
+            "max_points": 8,
+            "max_steps": 8,
+        }
+
+        px, py, pt, L, st = particle_tracking.particle_tracking_pollock(params)
+
+        self.assertEqual(st[0], 1)
+        self.assertEqual(L[0], 1)
+        self.assertAlmostEqual(px[0, 0], 0.5, places=6)
+        self.assertAlmostEqual(py[0, 0], 0.5, places=6)
+        self.assertAlmostEqual(pt[0, 0], 0.0, places=6)
+
+    def test_particle_tracking_pollock_invalid_shapes(self):
+        params = {
+            "x_faces": np.array([0.0, 1.0, 2.0], dtype=np.float32),
+            "y_faces": np.array([0.0, 1.0], dtype=np.float32),
+            "vx": np.ones((1, 2), dtype=np.float32),
+            "vy": np.zeros((2, 2), dtype=np.float32),
+            "seeds_x": np.array([0.0], dtype=np.float32),
+            "seeds_y": np.array([0.0], dtype=np.float32),
+        }
+
+        with self.assertRaises(ValueError):
+            particle_tracking.particle_tracking_pollock(params)
+
+    def test_particle_tracking_pollock_fastest_trajectory_compatibility(self):
+        x_faces = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 4), dtype=np.float32)
+        vy = np.zeros((3, 3), dtype=np.float32)
+
+        params = {
+            "x_faces": x_faces,
+            "y_faces": y_faces,
+            "vx": vx,
+            "vy": vy,
+            "seeds_x": np.array([0.0, 0.5], dtype=np.float32),
+            "seeds_y": np.array([0.25, 1.25], dtype=np.float32),
+            "right_x": x_faces[-1],
+            "max_points": 16,
+            "max_steps": 16,
+        }
+
+        px, py, pt, L, st = particle_tracking.particle_tracking_pollock(params)
+        res = particle_tracking.fastest_trajectory(px, py, pt, L, st)
+
+        self.assertEqual(res["particle_id"], 1)
+        self.assertAlmostEqual(res["travel_time"], 2.5, places=6)
+        self.assertAlmostEqual(res["x"][-1], x_faces[-1], places=6)
 
 
 if __name__ == '__main__':

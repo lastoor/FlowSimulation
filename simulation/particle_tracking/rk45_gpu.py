@@ -290,20 +290,40 @@ def rk45_arclength_kernel(
             y5 += ds * B5_tbl[j] * ky[j]
             t5 += ds * B5_tbl[j] * kt[j]
 
+        rhs_arclength(
+            x5, y5, xgrid, ygrid, x_faces, y_faces, vx, vy, nx, ny, velocity_mode, eps_speed, rhs, spv
+        )
+        kx[6], ky[6], kt[6] = rhs[0], rhs[1], rhs[2]
+
         x4, y4, t4 = x, y, t
-        for j in range(6):
+        for j in range(7):
             x4 += ds * B4_tbl[j] * kx[j]
             y4 += ds * B4_tbl[j] * ky[j]
             t4 += ds * B4_tbl[j] * kt[j]
-        x4 += ds * B4_tbl[6] * kx[0]
-        y4 += ds * B4_tbl[6] * ky[0]
-        t4 += ds * B4_tbl[6] * kt[0]
 
         ex = x5 - x4
         ey = y5 - y4
         err = math.sqrt(ex * ex + ey * ey) + 1e-30
 
         if err <= tol:
+            x_prev, y_prev, t_prev = x, y, t
+            if (x_prev < right_x) and (x5 >= right_x):
+                tau = (right_x - x_prev) / ((x5 - x_prev) + 1e-30)
+                if tau < 0.0:
+                    tau = 0.0
+                if tau > 1.0:
+                    tau = 1.0
+                x = right_x
+                y = y_prev + tau * (y5 - y_prev)
+                t = t_prev + tau * (t5 - t_prev)
+                if count < max_points:
+                    paths_x[pid, count] = x
+                    paths_y[pid, count] = y
+                    paths_t[pid, count] = t
+                    count += 1
+                st = 0
+                break
+
             x, y, t = x5, y5, t5
             if count < max_points:
                 paths_x[pid, count] = x
@@ -313,24 +333,6 @@ def rk45_arclength_kernel(
             ds = ds * min(5.0, max(0.2, 0.9 * math.pow(tol / err, 0.2)))
         else:
             ds = ds * max(0.1, 0.5 * math.pow(tol / err, 0.25))
-
-        if (x < right_x) and (x5 >= right_x):
-            denom = (x5 - x) + 1e-30
-            tau = (right_x - x) / denom
-            if tau < 0.0:
-                tau = 0.0
-            if tau > 1.0:
-                tau = 1.0
-            x = right_x
-            y = y + tau * (y5 - y)
-            t = t + tau * (t5 - t)
-            if count < max_points:
-                paths_x[pid, count] = x
-                paths_y[pid, count] = y
-                paths_t[pid, count] = t
-                count += 1
-            st = 0
-            break
 
     info_c = -1
     info_v = 0.0

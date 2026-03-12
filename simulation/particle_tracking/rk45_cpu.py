@@ -243,22 +243,41 @@ def _rk45_one_particle_mode(xgrid, ygrid,
             y5 += ds * B5[j] * ky[j]
             t5 += ds * B5[j] * kt[j]
 
+        # Dormand-Prince uses a 7th stage at the 5th-order solution for the
+        # embedded 4th-order estimate.
+        kx[6], ky[6], kt[6], _ = _rhs_arclength_mode(
+            x5, y5, xgrid, ygrid, x_faces, y_faces,
+            vx, vy, nx, ny, velocity_mode, eps_speed
+        )
+
         # 4th order estimate
         x4, y4, t4 = x, y, t
-        for j in range(6):
+        for j in range(7):
             x4 += ds * B4[j] * kx[j]
             y4 += ds * B4[j] * ky[j]
             t4 += ds * B4[j] * kt[j]
-        x4 += ds * B4[6] * kx[0]
-        y4 += ds * B4[6] * ky[0]
-        t4 += ds * B4[6] * kt[0]
 
         # error
         err = math.sqrt((x5-x4)**2 + (y5-y4)**2) + 1e-30
 
         if err <= tol:  # accept step
-            x, y, t = x5, y5, t5
+            x_prev, y_prev, t_prev = x, y, t
 
+            if x_prev < right_x <= x5:
+                tau = (right_x - x_prev) / ((x5 - x_prev) + 1e-30)
+                tau = min(max(tau, 0), 1)
+                x = right_x
+                y = y_prev + tau * (y5 - y_prev)
+                t = t_prev + tau * (t5 - t_prev)
+
+                x_path[count] = x
+                y_path[count] = y
+                t_path[count] = t
+                count += 1
+                st = 0
+                break
+
+            x, y, t = x5, y5, t5
             x_path[count] = x
             y_path[count] = y
             t_path[count] = t
@@ -267,21 +286,6 @@ def _rk45_one_particle_mode(xgrid, ygrid,
             ds = ds * min(5.0, max(0.2, 0.9 * (tol/err)**0.2))
         else:           # reject
             ds = ds * max(0.1, 0.5 * (tol/err)**0.25)
-
-        # Detect crossing
-        if x < right_x <= x5:
-            tau = (right_x - x) / ((x5-x) + 1e-30)
-            tau = min(max(tau, 0), 1)
-            x = right_x
-            y = y + tau * (y5-y)
-            t = t + tau * (t5-t)
-
-            x_path[count] = x
-            y_path[count] = y
-            t_path[count] = t
-            count += 1
-            st = 0
-            break
 
     return x_path, y_path, t_path, count, st
 

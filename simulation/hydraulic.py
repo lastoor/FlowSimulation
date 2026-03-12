@@ -5,7 +5,25 @@ Hydraulic head solving and velocity computation.
 import numpy as np
 
 
-def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000):
+def get_spacing_and_faces(coord_centers):
+    """Infer cell widths and face spacings from 1D cell-center coordinates."""
+    coord_centers = np.asarray(coord_centers, dtype=float).ravel()
+    n = coord_centers.size
+    if n < 2:
+        raise ValueError("coord_centers must contain at least 2 values")
+    edges = np.empty(n + 1, dtype=float)
+    edges[1:-1] = 0.5 * (coord_centers[:-1] + coord_centers[1:])
+    edges[0] = coord_centers[0] - 0.5 * (coord_centers[1] - coord_centers[0])
+    edges[-1] = coord_centers[-1] + 0.5 * (coord_centers[-1] - coord_centers[-2])
+    d_cell = np.diff(edges)
+    d_face = np.empty(n + 1, dtype=float)
+    d_face[1:-1] = 0.5 * (d_cell[:-1] + d_cell[1:])
+    d_face[0] = d_cell[0]
+    d_face[-1] = d_cell[-1]
+    return d_cell, d_face
+
+
+def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000, spacing_mode="uniform"):
     """
     Solve ∇·(K∇h) = 0 in a 2D domain with:
     - Dirichlet BCs on left/right: h(left)=dh*x_len, h(right)=0
@@ -19,6 +37,10 @@ def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000):
         Cell-center coordinates in x and y directions.
     dh : float
         Mean hydraulic head gradient between left and right boundaries.
+    spacing_mode : str
+        Grid-spacing method used in matrix assembly.
+        - "uniform": keep the current live behavior, dx=1/nx and dy=1/ny.
+        - "center_faces": infer cell widths and face spacings from x/y cell centers.
 
     Returns
     -------
@@ -35,24 +57,30 @@ def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000):
     from petsc4py import PETSc
 
     ny, nx = K.shape
-    # dx = np.diff(np.concatenate(([0], x + 0.5*(x[1]-x[0]))))
-    # dy = np.diff(np.concatenate(([0], y + 0.5*(y[1]-y[0]))))
-    dx = np.full(nx, 1.0/nx)
-    dy = np.full(ny, 1.0/ny)
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    if x.size != nx or y.size != ny:
+        raise ValueError("x and y must match K dimensions")
+    if spacing_mode == "uniform":
+        dx = np.full(nx, 1.0 / nx)
+        dy = np.full(ny, 1.0 / ny)
+        dx_face = np.empty(nx + 1)
+        dx_face[1:-1] = 0.5 * (dx[:-1] + dx[1:])
+        dx_face[0] = dx[0]
+        dx_face[-1] = dx[-1]
+        dy_face = np.empty(ny + 1)
+        dy_face[1:-1] = 0.5 * (dy[:-1] + dy[1:])
+        dy_face[0] = dy[0]
+        dy_face[-1] = dy[-1]
+    elif spacing_mode == "center_faces":
+        dx, dx_face = get_spacing_and_faces(x)
+        dy, dy_face = get_spacing_and_faces(y)
+    else:
+        raise ValueError("spacing_mode must be either 'uniform' or 'center_faces'")
     dz = 1.0
 
     def lid(i, j): return i*nx + j
     def hmean(a, b): return 2*a*b/(a+b + 1e-300)
-
-    dx_face = np.empty(nx+1)
-    dx_face[1:-1] = 0.5*(dx[:-1] + dx[1:])
-    dx_face[0] = dx[0]
-    dx_face[-1] = dx[-1]
-
-    dy_face = np.empty(ny+1)
-    dy_face[1:-1] = 0.5*(dy[:-1] + dy[1:])
-    dy_face[0] = dy[0]
-    dy_face[-1] = dy[-1]
 
     # PETSc assembly
     N = nx * ny
@@ -134,10 +162,18 @@ def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000):
     return h, msg, is_success
 
 
-def compute_velocity(K, x, y, h, output_location="face"):
+def compute_velocity(
+    K,
+    x,
+    y,
+    h,
+    output_location="face",
+    align_with_modflow=True,
+    face_output="trimmed",
+):
     """
-    Compute Darcy velocity using MODFLOW-consistent face discretization.
-    Kept for reference; compute_velocity implements the same formulation per USGS TM6-A16 Ch. 2.
+    Compute Darcy velocity using face discretization derived from cell-centered head.
+    When requested, face outputs are aligned with MODFLOW's QXX/QYY convention.
 
     Parameters
     ----------
@@ -150,9 +186,18 @@ def compute_velocity(K, x, y, h, output_location="face"):
     output_location : str, optional
         Output velocity location:
         - "cell": return cell-centered velocity fields (ny, nx) via averaging.
-        - "face": return face-centered velocity fields:
-          vx -> (ny, nx+1), vy -> (ny+1, nx).
+        - "face": return per-cell right/top-face velocity fields (ny, nx).
         Default is "face".
+    align_with_modflow : bool, optional
+        If True, force the outermost right/top faces to zero so the returned
+        face arrays match MODFLOW QXX/QYY budget exports. If False, keep the
+        computed one-sided boundary fluxes on the outer edge. Default is True.
+    face_output : str, optional
+        Face output format when ``output_location="face"``:
+        - "trimmed": return per-cell right/top-face arrays (ny, nx).
+        - "full": return physical face arrays vx_face (ny, nx+1),
+          vy_face (ny+1, nx).
+        Default is "trimmed".
 
     Returns
     -------
@@ -161,14 +206,14 @@ def compute_velocity(K, x, y, h, output_location="face"):
     """
     if output_location not in ("cell", "face"):
         raise ValueError("output_location must be either 'cell' or 'face'")
+    if face_output not in ("trimmed", "full"):
+        raise ValueError("face_output must be either 'trimmed' or 'full'")
 
     ny, nx = h.shape
 
     def hmean(a, b):
         return 2.0 * a * b / (a + b + 1e-300)
 
-    # Build cell widths from center coordinates using midpoint edges.
-    # This avoids spuriously halving the first cell when coordinates start at 0.
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     if x.size != nx or y.size != ny:
@@ -176,27 +221,8 @@ def compute_velocity(K, x, y, h, output_location="face"):
     if nx < 2 or ny < 2:
         raise ValueError("compute_velocity requires at least 2 cells in each direction")
 
-    x_edges = np.empty(nx + 1, dtype=float)
-    x_edges[1:-1] = 0.5 * (x[:-1] + x[1:])
-    x_edges[0] = x[0] - 0.5 * (x[1] - x[0])
-    x_edges[-1] = x[-1] + 0.5 * (x[-1] - x[-2])
-    dx = np.diff(x_edges)
-
-    y_edges = np.empty(ny + 1, dtype=float)
-    y_edges[1:-1] = 0.5 * (y[:-1] + y[1:])
-    y_edges[0] = y[0] - 0.5 * (y[1] - y[0])
-    y_edges[-1] = y[-1] + 0.5 * (y[-1] - y[-2])
-    dy = np.diff(y_edges)
-
-    dx_face = np.empty(nx + 1)
-    dx_face[1:-1] = 0.5 * (dx[:-1] + dx[1:])
-    dx_face[0] = dx[0]
-    dx_face[-1] = dx[-1]
-
-    dy_face = np.empty(ny + 1)
-    dy_face[1:-1] = 0.5 * (dy[:-1] + dy[1:])
-    dy_face[0] = dy[0]
-    dy_face[-1] = dy[-1]
+    dx, dx_face = get_spacing_and_faces(x)
+    dy, dy_face = get_spacing_and_faces(y)
 
     # Face-centered velocities (MODFLOW-style).
     vx_face = np.zeros((ny, nx + 1), dtype=float)
@@ -216,29 +242,25 @@ def compute_velocity(K, x, y, h, output_location="face"):
     vy_face[0, :] = -K[0, :] * (h[1, :] - h[0, :]) / dy_face[0]
     vy_face[ny, :] = -K[-1, :] * (h[-1, :] - h[-2, :]) / dy_face[-1]
 
-    # Align face outputs with MODFLOW budget convention:
-    # - QXX is the flow/velocity at each cell's right face (ny, nx)
-    # - QYY is the flow/velocity at each cell's "front" face (ny, nx)
-    # Using these slices removes the one-cell offset against MT3D/MODFLOW exports.
-    qxx = vx_face[:, 1:]
-    qyy = vy_face[1:, :]
-    # MODFLOW QXX/QYY do not include an external-neighbor exchange on the
-    # outer model edge in these arrays; set those outer faces to zero.
-    qxx[:, -1] = 0.0
-    qyy[-1, :] = 0.0
+    if align_with_modflow:
+        # MODFLOW budget exports omit external-neighbor exchange on the
+        # outer right/top boundaries; zero those faces to match exports.
+        vx_face = vx_face.copy()
+        vy_face = vy_face.copy()
+        vx_face[:, -1] = 0.0
+        vy_face[-1, :] = 0.0
 
     if output_location == "face":
+        if face_output == "full":
+            return vx_face, vy_face
+        # QXX/QYY are the per-cell right/top faces with shape matching h.
+        qxx = vx_face[:, 1:]
+        qyy = vy_face[1:, :]
         return qxx, qyy
 
-    # Convert MODFLOW-style per-cell face values to cell-centered values.
-    vx_cell = np.empty((ny, nx), dtype=float)
-    vy_cell = np.empty((ny, nx), dtype=float)
-
-    vx_cell[:, 0] = qxx[:, 0]
-    vx_cell[:, 1:] = 0.5 * (qxx[:, :-1] + qxx[:, 1:])
-
-    vy_cell[0, :] = qyy[0, :]
-    vy_cell[1:, :] = 0.5 * (qyy[:-1, :] + qyy[1:, :])
+    # Convert full left/right and bottom/top faces to cell-centered values.
+    vx_cell = 0.5 * (vx_face[:, :-1] + vx_face[:, 1:])
+    vy_cell = 0.5 * (vy_face[:-1, :] + vy_face[1:, :])
     return vx_cell, vy_cell
 
 

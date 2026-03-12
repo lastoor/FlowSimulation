@@ -28,6 +28,12 @@ from simulation import hydraulic
 class TestHydraulic(unittest.TestCase):
     """Test hydraulic functions."""
 
+    def test_get_spacing_and_faces_nonuniform(self):
+        centers = np.array([1.0, 2.0, 4.0], dtype=float)
+        d_cell, d_face = hydraulic.get_spacing_and_faces(centers)
+        np.testing.assert_array_almost_equal(d_cell, np.array([1.0, 1.5, 2.0]))
+        np.testing.assert_array_almost_equal(d_face, np.array([1.0, 1.25, 1.75, 2.0]))
+
     def test_mt3d_read_write_roundtrip(self):
         """write_mt3d_file output is parseable by read_mt3d_file."""
         variables = {
@@ -128,6 +134,105 @@ class TestHydraulic(unittest.TestCase):
         # Check that boundaries are computed (no crash)
         self.assertTrue(np.all(np.isfinite(vx)))
 
+    def test_compute_velocity_face_alignment_default_matches_modflow(self):
+        """Default trimmed face output should zero the outermost right/top faces."""
+        nx, ny = 5, 5
+        K = np.ones((ny, nx), dtype=float)
+        x = np.linspace(0, 4, nx)
+        y = np.linspace(0, 4, ny)
+        X, Y = np.meshgrid(x, y)
+        h = X + 2.0 * Y
+
+        qxx, qyy = hydraulic.compute_velocity(K, x, y, h, output_location="face")
+
+        np.testing.assert_array_almost_equal(qxx[:, -1], 0.0)
+        np.testing.assert_array_almost_equal(qyy[-1, :], 0.0)
+
+    def test_compute_velocity_face_alignment_false_keeps_boundary_flux_trimmed(self):
+        """Non-aligned trimmed face output should preserve computed outer-edge fluxes."""
+        nx, ny = 5, 5
+        K = np.ones((ny, nx), dtype=float)
+        x = np.linspace(0, 4, nx)
+        y = np.linspace(0, 4, ny)
+        X, Y = np.meshgrid(x, y)
+        h = X + 2.0 * Y
+
+        qxx, qyy = hydraulic.compute_velocity(
+            K, x, y, h, output_location="face", align_with_modflow=False
+        )
+
+        self.assertTrue(np.all(np.isfinite(qxx)))
+        self.assertTrue(np.all(np.isfinite(qyy)))
+        np.testing.assert_array_almost_equal(qxx[:, -1], -1.0)
+        np.testing.assert_array_almost_equal(qyy[-1, :], -2.0)
+
+    def test_compute_velocity_face_output_full_shapes(self):
+        """Full face output should return the staggered-grid face arrays."""
+        nx, ny = 5, 4
+        K = np.ones((ny, nx), dtype=float)
+        x = np.linspace(0, 4, nx)
+        y = np.linspace(0, 3, ny)
+        X, Y = np.meshgrid(x, y)
+        h = X + 2.0 * Y
+
+        vx_face, vy_face = hydraulic.compute_velocity(
+            K, x, y, h, output_location="face", face_output="full", align_with_modflow=False
+        )
+
+        self.assertEqual(vx_face.shape, (ny, nx + 1))
+        self.assertEqual(vy_face.shape, (ny + 1, nx))
+        np.testing.assert_array_almost_equal(vx_face[:, -1], -1.0)
+        np.testing.assert_array_almost_equal(vy_face[-1, :], -2.0)
+
+    def test_compute_velocity_face_output_full_alignment_matches_modflow(self):
+        """Full face output should also zero the outer right/top faces when aligned."""
+        nx, ny = 5, 5
+        K = np.ones((ny, nx), dtype=float)
+        x = np.linspace(0, 4, nx)
+        y = np.linspace(0, 4, ny)
+        X, Y = np.meshgrid(x, y)
+        h = X + 2.0 * Y
+
+        vx_face, vy_face = hydraulic.compute_velocity(
+            K, x, y, h, output_location="face", face_output="full", align_with_modflow=True
+        )
+
+        np.testing.assert_array_almost_equal(vx_face[:, -1], 0.0)
+        np.testing.assert_array_almost_equal(vy_face[-1, :], 0.0)
+
+    def test_compute_velocity_cell_uses_full_face_average(self):
+        """Cell-centered output should average the full left/right and bottom/top faces."""
+        nx, ny = 5, 5
+        K = np.ones((ny, nx), dtype=float)
+        x = np.linspace(0, 4, nx)
+        y = np.linspace(0, 4, ny)
+        X, Y = np.meshgrid(x, y)
+        h = X + 2.0 * Y
+
+        vx_aligned, vy_aligned = hydraulic.compute_velocity(
+            K, x, y, h, output_location="cell", align_with_modflow=True
+        )
+        vx_free, vy_free = hydraulic.compute_velocity(
+            K, x, y, h, output_location="cell", align_with_modflow=False
+        )
+
+        np.testing.assert_array_almost_equal(vx_aligned[:, 0], -1.0)
+        np.testing.assert_array_almost_equal(vy_aligned[0, :], -2.0)
+        np.testing.assert_array_almost_equal(vx_aligned[:, -1], -0.5)
+        np.testing.assert_array_almost_equal(vy_aligned[-1, :], -1.0)
+        np.testing.assert_array_almost_equal(vx_free[:, 0], -1.0)
+        np.testing.assert_array_almost_equal(vy_free[0, :], -2.0)
+        np.testing.assert_array_almost_equal(vx_free[:, -1], -1.0)
+        np.testing.assert_array_almost_equal(vy_free[-1, :], -2.0)
+
+    @unittest.skipIf(not PETSC_AVAILABLE, "petsc4py not available")
+    def test_solve_head_invalid_spacing_mode(self):
+        K = np.ones((3, 3), dtype=float)
+        x = np.linspace(0, 2, 3)
+        y = np.linspace(0, 2, 3)
+        with self.assertRaises(ValueError):
+            hydraulic.solve_head(K, x, y, spacing_mode="bad_mode")
+
     @unittest.skipIf(not PETSC_AVAILABLE, "petsc4py not available")
     def test_solve_head_uniform_conductivity(self):
         """Test head solver for uniform conductivity (should be linear)."""
@@ -149,6 +254,24 @@ class TestHydraulic(unittest.TestCase):
         for i in range(5):
             expected = 0.01 * x_len * (1 - i/4)  # linear from left to right
             self.assertAlmostEqual(h[0, i], expected, delta=0.005)
+
+    @unittest.skipIf(not PETSC_AVAILABLE, "petsc4py not available")
+    def test_solve_head_center_faces_nonuniform_grid(self):
+        """Center-face spacing mode should solve on nonuniform cell-center grids."""
+        K = np.ones((4, 4), dtype=float)
+        x = np.array([0.5, 1.5, 3.5, 6.5], dtype=float)
+        y = np.array([1.0, 2.5, 4.5, 7.5], dtype=float)
+
+        h, msg, is_successful = hydraulic.solve_head(
+            K, x, y, dh=0.01, spacing_mode="center_faces"
+        )
+
+        self.assertTrue(is_successful, msg=f"Solver failed: {msg}")
+        self.assertEqual(h.shape, (4, 4))
+        self.assertTrue(np.all(np.isfinite(h)))
+        for row in range(4):
+            for col in range(1, 4):
+                self.assertLess(h[row, col], h[row, col - 1] + 1e-10)
 
     @unittest.skipIf(not PETSC_AVAILABLE, "petsc4py not available")
     def test_solve_head_heterogeneous_conductivity(self):

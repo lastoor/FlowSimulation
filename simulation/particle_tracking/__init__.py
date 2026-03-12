@@ -1,15 +1,16 @@
 """
-Particle tracking: CPU (RK45), PAR2 (external), and GPU (CUDA) backends.
+Particle tracking: CPU (RK45), Pollock, PAR2 (external), and GPU (CUDA) backends.
 
 Use this package as before:
   from simulation import particle_tracking
   particle_tracking.particle_tracking_cpu(params)
+  particle_tracking.particle_tracking_pollock(params)
   particle_tracking.fastest_trajectory(px, py, pt, L, st)
   particle_tracking.run_par2(path_par2, path_p2input, path_p2output)
   particle_tracking.gpu_track_particles_arclength(...)
 
 Or import submodules explicitly:
-  from simulation.particle_tracking import rk45_cpu, par2, rk45_gpu
+  from simulation.particle_tracking import rk45_cpu, pollock, par2, rk45_gpu
 """
 
 from .rk45_cpu import (
@@ -19,6 +20,11 @@ from .rk45_cpu import (
     rhs_arclength,
     rk45_one_particle,
     particle_tracking_cpu,
+)
+from .pollock import (
+    pollock_step,
+    trace_pathline,
+    particle_tracking_pollock,
 )
 from .par2 import run_par2
 from .utils import fastest_trajectory, fastest_trajectory_with_snapshot
@@ -38,6 +44,9 @@ __all__ = [
     "rhs_arclength",
     "rk45_one_particle",
     "particle_tracking_cpu",
+    "pollock_step",
+    "trace_pathline",
+    "particle_tracking_pollock",
     "fastest_trajectory",
     "fastest_trajectory_with_snapshot",
     "run_par2",
