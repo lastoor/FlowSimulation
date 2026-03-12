@@ -4,6 +4,7 @@ Test comparing MODFLOW (mf2005) and PETSc solutions for hydraulic head
 and velocity fields.
 """
 
+import argparse
 import sys
 import os
 import unittest
@@ -32,6 +33,241 @@ try:
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
+
+
+def _parse_args():
+    p = argparse.ArgumentParser(
+        description="Compare MODFLOW (mf2005) and PETSc hydraulic head/velocity solutions.",
+    )
+    p.add_argument("--num-pt", type=int, default=100, help="Grid size in x/y.")
+    p.add_argument("--dh", type=float, default=0.01, help="Hydraulic head gradient.")
+    p.add_argument("--seed", type=int, default=56, help="Random seed for logK generation.")
+    p.add_argument("--c", type=float, default=1.0, help="fBm scale parameter.")
+    p.add_argument("--alpha", type=float, default=0.5, help="fBm alpha parameter.")
+    p.add_argument("--minpadding", type=int, default=0, help="fBm padding.")
+    p.add_argument("--rtol", type=float, default=1e-10, help="PETSc relative tolerance.")
+    p.add_argument("--atol", type=float, default=1e-10, help="PETSc absolute tolerance.")
+    p.add_argument("--max-it", type=int, default=10000, help="PETSc max iterations.")
+    p.add_argument("--velocity-location", choices=("face", "cell"), default="face")
+    p.add_argument("--align-with-modflow-velocity", dest="align_with_modflow", action="store_true", default=True)
+    p.add_argument("--no-align-with-modflow-velocity", dest="align_with_modflow", action="store_false")
+    p.add_argument("--spacing-mode", choices=("uniform", "center_faces"), default="center_faces")
+    p.add_argument("--face-output", choices=("trimmed", "full"), default="trimmed")
+    p.add_argument("--skip-figures", action="store_true", help="Do not save comparison figures.")
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path(__file__).parent.resolve(),
+        help="Output directory for MODFLOW artifacts and figures.",
+    )
+    return p.parse_args()
+
+
+def _default_opts():
+    return argparse.Namespace(
+        num_pt=100,
+        dh=0.01,
+        seed=56,
+        c=10.0,
+        alpha=0.5,
+        minpadding=0,
+        rtol=1e-10,
+        atol=1e-10,
+        max_it=10000,
+        output_location="face",
+        align_with_modflow=True,
+        spacing_mode="uniform",
+        face_output="trimmed",
+        skip_figures=False,
+        out_dir=Path(__file__).parent.resolve(),
+    )
+
+
+def _resolve_modflow_exe():
+    """Resolve MODFLOW executable from env or common install path."""
+    path_mf2005_env = os.environ.get('MODFLOW_EXE', None)
+    if path_mf2005_env:
+        return Path(path_mf2005_env).resolve()
+    for p in [Path('~/bin/mf2005').expanduser()]:
+        if p.exists() and p.is_file():
+            return p.resolve()
+    return None
+
+
+def run_compare_modflow_petsc(opts):
+    """Run the MODFLOW vs PETSc comparison and return summary metrics."""
+    if not FLOPY_AVAILABLE:
+        raise RuntimeError("flopy not available")
+    path_mf2005 = _resolve_modflow_exe()
+    if path_mf2005 is None or not path_mf2005.exists():
+        raise RuntimeError(
+            "MODFLOW executable not found. Set MODFLOW_EXE environment variable or install in ~/bin/mf2005."
+        )
+
+    num_pt = int(opts.num_pt)
+    x = np.arange(num_pt)
+    y = np.arange(num_pt)
+    grad_head = float(opts.dh)
+
+    np.random.seed(int(opts.seed))
+    fbm_gen = grf_generation.fBmGenerator(
+        c=float(opts.c),
+        alpha=float(opts.alpha),
+        num_pt=num_pt,
+        dim=2,
+        minpadding=int(opts.minpadding),
+    )
+    field, msg = grf_generation.generate_logk_field(fbm_gen)
+    if field is None:
+        raise RuntimeError(f"Field generation failed: {msg}")
+    if field.ndim != 2:
+        raise ValueError(f"Expected 2D field, got {field.ndim}D")
+    logk_field = field
+
+    path_wd = Path(opts.out_dir).resolve()
+    path_wd.mkdir(parents=True, exist_ok=True)
+
+    mf2005_config = {
+        'modflow_exe': str(path_mf2005),
+        'model_ws': str(path_wd / 'mf2005_output'),
+        'model_name': 'mf2005_model',
+        'outftl_name': str(path_wd / 'mf2005_output/mf2005_model.ftl'),
+        'grad_head': grad_head,
+        'lx': num_pt,
+        'ly': num_pt,
+        'lz': 1,
+        'dx': 1,
+        'dy': 1,
+        'dz': 1,
+        'logk_field': logk_field,
+    }
+
+    model_ws = mf2005_config['model_ws']
+    model_name = mf2005_config['model_name']
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        return_msg_mf = hydraulic.run_modflow(mf2005_config)
+    print(return_msg_mf)
+    if 'successfully' not in return_msg_mf.lower():
+        raise RuntimeError(f"MODFLOW run failed: {return_msg_mf}")
+
+    headobj = flopy.utils.HeadFile(os.path.join(model_ws, f"{model_name}.hds"))
+    try:
+        head_mf = headobj.get_data(kstpkper=(0, 0))
+        head_mf_2d = head_mf[0, :, :] if head_mf.ndim == 3 else head_mf
+    finally:
+        headobj.close()
+
+    data = hydraulic.read_mt3d_file(str(path_wd / 'mf2005_output/mf2005_model.ftl'))
+    QXX = data['QXX']
+    QYY = data['QYY']
+
+    K = np.exp(logk_field)
+    h_petsc, msg_petsc, is_success = hydraulic.solve_head(
+        K,
+        x,
+        y,
+        dh=grad_head,
+        rtol=float(opts.rtol),
+        atol=float(opts.atol),
+        max_it=int(opts.max_it),
+        spacing_mode=opts.spacing_mode,
+    )
+    print(f"PETSc solver: {msg_petsc}")
+    if not is_success:
+        raise RuntimeError(f"PETSc solver failed: {msg_petsc}")
+
+    vel_kw = {
+        "output_location": opts.velocity_location,
+        "align_with_modflow": bool(opts.align_with_modflow),
+    }
+    if opts.velocity_location == "face":
+        vel_kw["face_output"] = opts.face_output
+    vx_cmp, vy_cmp = hydraulic.compute_velocity(K, x, y, h_petsc, **vel_kw)
+    vx_cell, vy_cell = hydraulic.compute_velocity(
+        K, x, y, h_petsc, output_location='cell', align_with_modflow=bool(opts.align_with_modflow)
+    )
+
+    def overlap_2d(a, b):
+        r = min(a.shape[0], b.shape[0])
+        c = min(a.shape[1], b.shape[1])
+        return (np.s_[:r, :c], np.s_[:r, :c])
+
+    qxx_slice_v, vx_slice_v = overlap_2d(QXX, vx_cmp)
+    qyy_slice_v, vy_slice_v = overlap_2d(QYY, vy_cmp)
+    QXX_v = QXX[qxx_slice_v]
+    QYY_v = QYY[qyy_slice_v]
+    vx_v = vx_cmp[vx_slice_v]
+    vy_v = vy_cmp[vy_slice_v]
+
+    qxx_slice_c, vx_slice_c = overlap_2d(QXX, vx_cell)
+    qyy_slice_c, vy_slice_c = overlap_2d(QYY, vy_cell)
+    QXX_c = QXX[qxx_slice_c]
+    QYY_c = QYY[qyy_slice_c]
+    vx_cell_o = vx_cell[vx_slice_c]
+    vy_cell_o = vy_cell[vy_slice_c]
+
+    if head_mf_2d.shape != h_petsc.shape:
+        raise RuntimeError(f"Head shape mismatch: MODFLOW {head_mf_2d.shape} vs PETSc {h_petsc.shape}")
+
+    head_diff = np.abs(head_mf_2d - h_petsc)
+    head_rmse = np.sqrt(np.mean(head_diff**2))
+    head_max_diff = np.max(head_diff)
+    head_mean_mf = np.mean(np.abs(head_mf_2d))
+    print(f"\nHead comparison:")
+    print(f"  RMSE: {head_rmse:.6e}")
+    print(f"  Max absolute difference: {head_max_diff:.6e}")
+    print(f"  Mean |MODFLOW head|: {head_mean_mf:.6e}")
+    print(f"  Relative RMSE: {head_rmse/head_mean_mf:.6e}")
+
+    def vel_stats(q, v):
+        diff = np.abs(q - v)
+        rmse = np.sqrt(np.mean(diff**2))
+        mean_q = np.mean(np.abs(q))
+        rel = rmse / mean_q if mean_q > 1e-10 else rmse
+        if q.size <= 1:
+            corr = 1.0
+        else:
+            corr = np.corrcoef(q.flatten(), v.flatten())[0, 1]
+            corr = 1.0 if np.isnan(corr) else corr
+        return rmse, mean_q, rel, corr
+
+    vx_rmse_v, vx_mean_v, vx_rel_v, vx_corr_v = vel_stats(QXX_v, vx_v)
+    vy_rmse_v, vy_mean_v, vy_rel_v, vy_corr_v = vel_stats(QYY_v, vy_v)
+    print(
+        f"\nVelocity comparison ({opts.velocity_location}, overlap shape {vx_v.shape} / {vy_v.shape}):"
+    )
+    print(f"  vx: RMSE={vx_rmse_v:.6e}, mean|QXX|={vx_mean_v:.6e}, rel={vx_rel_v:.6e}, corr={vx_corr_v:.4f}")
+    print(f"  vy: RMSE={vy_rmse_v:.6e}, mean|QYY|={vy_mean_v:.6e}, rel={vy_rel_v:.6e}, corr={vy_corr_v:.4f}")
+
+    vx_rmse_c, vx_mean_c, vx_rel_c, vx_corr_c = vel_stats(QXX_c, vx_cell_o)
+    vy_rmse_c, vy_mean_c, vy_rel_c, vy_corr_c = vel_stats(QYY_c, vy_cell_o)
+    print(f"\nVelocity comparison (cell-centered, overlap shape {vx_cell_o.shape} / {vy_cell_o.shape}):")
+    print(f"  vx: RMSE={vx_rmse_c:.6e}, mean|QXX|={vx_mean_c:.6e}, rel={vx_rel_c:.6e}, corr={vx_corr_c:.4f}")
+    print(f"  vy: RMSE={vy_rmse_c:.6e}, mean|QYY|={vy_mean_c:.6e}, rel={vy_rel_c:.6e}, corr={vy_corr_c:.4f}")
+
+    if MATPLOTLIB_AVAILABLE and not opts.skip_figures:
+        _save_comparison_figures(
+            out_dir=path_wd,
+            head_mf=head_mf_2d,
+            head_petsc=h_petsc,
+            QXX_c=QXX_c,
+            QYY_c=QYY_c,
+            vx_cell_o=vx_cell_o,
+            vy_cell_o=vy_cell_o,
+        )
+    elif not MATPLOTLIB_AVAILABLE:
+        print("Skipping visualization (matplotlib not available).")
+
+    return {
+        "head_shape": head_mf_2d.shape,
+        "head_rel": head_rmse / head_mean_mf if head_mean_mf > 1e-10 else head_rmse,
+        "head_rmse": head_rmse,
+        "velocity_rmse": (vx_rmse_v, vy_rmse_v),
+        "velocity_corr": (vx_corr_v, vy_corr_v),
+        "cell_velocity_rmse": (vx_rmse_c, vy_rmse_c),
+        "cell_velocity_corr": (vx_corr_c, vy_corr_c),
+    }
 
 
 def _save_comparison_figures(out_dir, head_mf, head_petsc, QXX_c, QYY_c, vx_cell_o, vy_cell_o):
@@ -125,213 +361,25 @@ class TestCompareModflowPETSc(unittest.TestCase):
     @unittest.skipIf(not FLOPY_AVAILABLE, "flopy not available")
     def test_compare_modflow_petsc(self):
         """Compare MODFLOW and PETSc solutions for head and velocity."""
-        # Test parameters
-        num_pt = 100  # Grid size
-        x = np.arange(num_pt)
-        y = np.arange(num_pt)
-        grad_head = 0.01  # Hydraulic head gradient
-        
-        # Generate logK field using fBm
-        np.random.seed(56)  # For reproducibility
-        fbm_gen = grf_generation.fBmGenerator(
-            c=10, 
-            alpha=0.5, 
-            num_pt=num_pt, 
-            dim=2, 
-            minpadding=0
-        )
-        field, msg = grf_generation.generate_logk_field(fbm_gen)
-        self.assertIsNotNone(field, f"Field generation failed: {msg}")
-        
-        # Convert to 2D if needed (should already be 2D)
-        if field.ndim == 2:
-            logk_field = field
-        else:
-            raise ValueError(f"Expected 2D field, got {field.ndim}D")
-        
-        # Setup MODFLOW configuration
-        # Use paths relative to test file for portability
-        # Get project root directory (two levels up from test file)
-        path_wd = Path(__file__).parent.resolve()
-        path_wd.mkdir(parents=True, exist_ok=True)  # Create directory if it doesn't exist
-        
-        # MODFLOW executable: try common locations, or use environment variable
-        # This allows users to override via environment variable
-        path_mf2005_env = os.environ.get('MODFLOW_EXE', None)
-        if path_mf2005_env:
-            path_mf2005 = Path(path_mf2005_env).resolve()
-        else:
-            # Try common locations
-            common_paths = [
-                Path('~/bin/mf2005').expanduser(),
-            ]
-            path_mf2005 = None
-            for p in common_paths:
-                if p.exists() and p.is_file():
-                    path_mf2005 = p.resolve()
-                    break
-        
-        if path_mf2005 is None or not path_mf2005.exists():
-            self.skipTest("MODFLOW executable not found. Set MODFLOW_EXE environment variable or install in common location.")
-        mf2005_config = {
-            'modflow_exe': str(path_mf2005),
-            'model_ws': str(path_wd / 'mf2005_output'),
-            'model_name': 'mf2005_model',
-            'outftl_name': str(path_wd / 'mf2005_output/mf2005_model.ftl'),
-            'grad_head': grad_head,
-            'lx': num_pt,
-            'ly': num_pt,
-            'lz': 1,
-            'dx': 1,
-            'dy': 1,
-            'dz': 1,
-            'logk_field': logk_field,
-        }
-        
-        # Run MODFLOW (suppress ResourceWarnings from flopy/subprocess)
-        model_ws = mf2005_config['model_ws']
-        model_name = mf2005_config['model_name']
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ResourceWarning)
-            return_msg_mf = hydraulic.run_modflow(mf2005_config)
-        print(return_msg_mf)
-        self.assertIn('successfully', return_msg_mf.lower(),
-                     f"MODFLOW run failed: {return_msg_mf}")
-
-        # Read MODFLOW head results; ensure head file is closed
-        headobj = flopy.utils.HeadFile(os.path.join(model_ws, f"{model_name}.hds"))
-        try:
-            head_mf = headobj.get_data(kstpkper=(0, 0))
-            if head_mf.ndim == 3:
-                head_mf_2d = head_mf[0, :, :]  # (nrow, ncol)
-            else:
-                head_mf_2d = head_mf
-        finally:
-            headobj.close()
-
-        # Read MODFLOW velocity field
-        data = hydraulic.read_mt3d_file(str(path_wd / 'mf2005_output/mf2005_model.ftl'))
-        QXX = data['QXX']  # MODFLOW velocity in x-direction
-        QYY = data['QYY']  # MODFLOW velocity in y-direction
-        
-        # Run PETSc solver
-        K = np.exp(logk_field)  # Convert logK to K
-
-        h_petsc, msg_petsc, is_success = hydraulic.solve_head(
-            K, x, y, dh=grad_head, rtol=1e-10, atol=1e-10, max_it=10000
-        )
-        
-        self.assertTrue(is_success, f"PETSc solver failed: {msg_petsc}")
-        print(f"PETSc solver: {msg_petsc}")
-        
-        # Compute velocity from PETSc (both face- and cell-centered)
-        vx_face, vy_face = hydraulic.compute_velocity(
-            K, x, y, h_petsc, output_location='face'
-        )
-        vx_cell, vy_cell = hydraulic.compute_velocity(
-            K, x, y, h_petsc, output_location='cell'
-        )
-        
-        def overlap_2d(a, b):
-            """Return (a_slice, b_slice) so that a[a_slice].shape == b[b_slice].shape (overlapping region)."""
-            r = min(a.shape[0], b.shape[0])
-            c = min(a.shape[1], b.shape[1])
-            return (np.s_[:r, :c], np.s_[:r, :c])
-        
-        # Compare both face and cell using overlapping regions when dimensions differ
-        # --- Face-centered comparison (overlapping)
-        qxx_slice_f, vx_slice_f = overlap_2d(QXX, vx_face)
-        qyy_slice_f, vy_slice_f = overlap_2d(QYY, vy_face)
-        QXX_f = QXX[qxx_slice_f]
-        QYY_f = QYY[qyy_slice_f]
-        vx_face_o = vx_face[vx_slice_f]
-        vy_face_o = vy_face[vy_slice_f]
-        
-        # --- Cell-centered comparison (overlapping)
-        qxx_slice_c, vx_slice_c = overlap_2d(QXX, vx_cell)
-        qyy_slice_c, vy_slice_c = overlap_2d(QYY, vy_cell)
-        QXX_c = QXX[qxx_slice_c]
-        QYY_c = QYY[qyy_slice_c]
-        vx_cell_o = vx_cell[vx_slice_c]
-        vy_cell_o = vy_cell[vy_slice_c]
-        
-        # Ensure shapes match
-        self.assertEqual(head_mf_2d.shape, h_petsc.shape, 
-                        f"Head shape mismatch: MODFLOW {head_mf_2d.shape} vs PETSc {h_petsc.shape}")
-        
-        # Compare head fields
-        head_diff = np.abs(head_mf_2d - h_petsc)
-        head_rmse = np.sqrt(np.mean(head_diff**2))
-        head_max_diff = np.max(head_diff)
-        head_mean_mf = np.mean(np.abs(head_mf_2d))
-        
-        print(f"\nHead comparison:")
-        print(f"  RMSE: {head_rmse:.6e}")
-        print(f"  Max absolute difference: {head_max_diff:.6e}")
-        print(f"  Mean |MODFLOW head|: {head_mean_mf:.6e}")
-        print(f"  Relative RMSE: {head_rmse/head_mean_mf:.6e}")
-        
-        # Compare velocity fields: both face-centered and cell-centered (overlapping regions)
-        def vel_stats(q, v):
-            diff = np.abs(q - v)
-            rmse = np.sqrt(np.mean(diff**2))
-            mean_q = np.mean(np.abs(q))
-            rel = rmse / mean_q if mean_q > 1e-10 else rmse
-            if q.size <= 1:
-                corr = 1.0
-            else:
-                corr = np.corrcoef(q.flatten(), v.flatten())[0, 1]
-                corr = 1.0 if np.isnan(corr) else corr  # constant arrays
-            return rmse, mean_q, rel, corr
-        
-        # Face-centered (overlapping)
-        vx_rmse_f, vx_mean_f, vx_rel_f, vx_corr_f = vel_stats(QXX_f, vx_face_o)
-        vy_rmse_f, vy_mean_f, vy_rel_f, vy_corr_f = vel_stats(QYY_f, vy_face_o)
-        print(f"\nVelocity comparison (face-centered, overlap shape {vx_face_o.shape} / {vy_face_o.shape}):")
-        print(f"  vx: RMSE={vx_rmse_f:.6e}, mean|QXX|={vx_mean_f:.6e}, rel={vx_rel_f:.6e}, corr={vx_corr_f:.4f}")
-        print(f"  vy: RMSE={vy_rmse_f:.6e}, mean|QYY|={vy_mean_f:.6e}, rel={vy_rel_f:.6e}, corr={vy_corr_f:.4f}")
-        
-        # Cell-centered (overlapping)
-        vx_rmse_c, vx_mean_c, vx_rel_c, vx_corr_c = vel_stats(QXX_c, vx_cell_o)
-        vy_rmse_c, vy_mean_c, vy_rel_c, vy_corr_c = vel_stats(QYY_c, vy_cell_o)
-        print(f"\nVelocity comparison (cell-centered, overlap shape {vx_cell_o.shape} / {vy_cell_o.shape}):")
-        print(f"  vx: RMSE={vx_rmse_c:.6e}, mean|QXX|={vx_mean_c:.6e}, rel={vx_rel_c:.6e}, corr={vx_corr_c:.4f}")
-        print(f"  vy: RMSE={vy_rmse_c:.6e}, mean|QYY|={vy_mean_c:.6e}, rel={vy_rel_c:.6e}, corr={vy_corr_c:.4f}")
-        
-        # Visualize and save head and velocity fields and their differences
-        if MATPLOTLIB_AVAILABLE:
-            _save_comparison_figures(
-                out_dir=path_wd,
-                head_mf=head_mf_2d,
-                head_petsc=h_petsc,
-                QXX_c=QXX_c,
-                QYY_c=QYY_c,
-                vx_cell_o=vx_face_o,
-                vy_cell_o=vy_face_o,
+        if not FLOPY_AVAILABLE:
+            self.skipTest("flopy not available")
+        if _resolve_modflow_exe() is None:
+            self.skipTest(
+                "MODFLOW executable not found. Set MODFLOW_EXE environment variable or install in ~/bin/mf2005."
             )
-        else:
-            print("Skipping visualization (matplotlib not available).")
-        
-        # Assertions - allow for numerical differences
-        # Head: within 5% relative error (different solvers/discretizations)
-        head_rel = head_rmse / head_mean_mf if head_mean_mf > 1e-10 else head_rmse
-        self.assertLess(head_rel, 0.05, 
-                        f"Head RMSE too large: {head_rel:.6e} (threshold: 0.05)")
-        
-        # Velocity: require both face and cell comparisons to pass (absolute RMSE and correlation)
-        self.assertLess(vx_rmse_f, 0.1, f"Velocity X (face) absolute RMSE too large: {vx_rmse_f:.6e}")
-        self.assertLess(vy_rmse_f, 0.1, f"Velocity Y (face) absolute RMSE too large: {vy_rmse_f:.6e}")
-        self.assertGreater(vx_corr_f, 0.5, f"Velocity X (face) correlation too low: {vx_corr_f:.6f}")
-        self.assertGreater(vy_corr_f, 0.5, f"Velocity Y (face) correlation too low: {vy_corr_f:.6f}")
-        self.assertLess(vx_rmse_c, 0.1, f"Velocity X (cell) absolute RMSE too large: {vx_rmse_c:.6e}")
-        self.assertLess(vy_rmse_c, 0.1, f"Velocity Y (cell) absolute RMSE too large: {vy_rmse_c:.6e}")
-        self.assertGreater(vx_corr_c, 0.5, f"Velocity X (cell) correlation too low: {vx_corr_c:.6f}")
-        self.assertGreater(vy_corr_c, 0.5, f"Velocity Y (cell) correlation too low: {vy_corr_c:.6f}")
-        
-        # Check that solutions are not identical (would indicate a bug)
-        self.assertGreater(head_rmse, 1e-10, 
-                          "Head solutions are too similar (possible bug)")
+        metrics = run_compare_modflow_petsc(_default_opts())
+        self.assertEqual(metrics["head_shape"], (100, 100))
+        self.assertLess(metrics["head_rel"], 0.05, f"Head RMSE too large: {metrics['head_rel']:.6e}")
+        self.assertLess(metrics["velocity_rmse"][0], 0.1)
+        self.assertLess(metrics["velocity_rmse"][1], 0.1)
+        self.assertGreater(metrics["velocity_corr"][0], 0.5)
+        self.assertGreater(metrics["velocity_corr"][1], 0.5)
+        self.assertLess(metrics["cell_velocity_rmse"][0], 0.1)
+        self.assertLess(metrics["cell_velocity_rmse"][1], 0.1)
+        self.assertGreater(metrics["cell_velocity_corr"][0], 0.5)
+        self.assertGreater(metrics["cell_velocity_corr"][1], 0.5)
+        self.assertGreater(metrics["head_rmse"], 1e-10)
 
 
 if __name__ == '__main__':
-    unittest.main()
+    run_compare_modflow_petsc(_parse_args())

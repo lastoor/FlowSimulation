@@ -128,6 +128,25 @@ px, py, pt, L, st = particle_tracking.particle_tracking_pollock(params)
 best = particle_tracking.fastest_trajectory(px, py, pt, L, st)
 ```
 
+## PAR2 Comparison Workflow
+- `tests/Compare_PAR2_Py/compare.py` now includes Pollock in the solver comparison workflow alongside PAR2, RK45 CPU/GPU, RK4 FP, and optional MODPATH7.
+- New CLI control:
+  - `--no-pollock`: skip Pollock while leaving the other solvers enabled.
+- The comparison script still uses trimmed `QXX`/`QYY`-style arrays for PAR2/RK45/RK4 plotting and file outputs, but it now reconstructs Pollock inputs internally:
+  - `x_faces`, `y_faces`
+  - `vx_full (ny, nx + 1)`
+  - `vy_full (ny + 1, nx)`
+- Pollock results are now included in:
+  - console travel-time summaries
+  - saved `.npz` outputs as `pollock_x`, `pollock_y`, `pollock_time`
+  - saved reconstructed inputs as `pollock_x_faces`, `pollock_y_faces`, `pollock_vx_full`, `pollock_vy_full`
+  - figure overlays and synthetic-case evaluation metrics
+- Example:
+
+```bash
+python tests/Compare_PAR2_Py/compare.py --test-case synthetic --no-par2 --no-rk45-gpu
+```
+
 ## Hydraulic Grid Options
 - `simulation.hydraulic.get_spacing_and_faces(coord_centers)` is the shared helper used to infer cell widths and face spacings from 1D cell-center coordinates.
 - `solve_head(..., spacing_mode="uniform")` keeps the current live solver behavior with uniform `dx=1/nx`, `dy=1/ny`.
@@ -136,6 +155,29 @@ best = particle_tracking.fastest_trajectory(px, py, pt, L, st)
 - `compute_velocity(..., output_location="face", face_output="full")` returns staggered full face arrays `vx_face (ny, nx+1)` and `vy_face (ny+1, nx)`.
 - `compute_velocity(..., align_with_modflow=True)` zeros the outer right/top faces to match MODFLOW `QXX/QYY`; `False` preserves the computed boundary face fluxes.
 - `compute_velocity(..., output_location="cell")` now averages the full left/right and bottom/top face arrays for every cell.
+
+## MODFLOW vs PETSc Comparison CLI
+- `tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py` can now be run directly with CLI options instead of only through `unittest`.
+- Supported runtime controls include:
+  - `--num-pt`
+  - `--dh`
+  - `--rtol`, `--atol`, `--max-it`
+  - `--output-location {face,cell}`
+  - `--align-with-modflow-velocity` / `--no-align-with-modflow-velocity`
+  - `--spacing-mode {uniform,center_faces}`
+  - `--face-output {trimmed,full}`
+  - `--skip-figures`
+  - `--out-dir`
+- Default direct-run behavior is kept compatible with the old test path: `output_location="face"`, `align_with_modflow=True`, `spacing_mode="uniform"`, and `face_output="trimmed"`.
+- Example:
+
+```bash
+python tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py \
+  --dh 0.02 \
+  --spacing-mode center_faces \
+  --output-location face \
+  --face-output full
+```
 
 ## Possible issues
 

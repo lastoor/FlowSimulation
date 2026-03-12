@@ -1,5 +1,19 @@
 # Agent Log
 
+## 2026-03-12 03:20:00 UTC
+- Added Pollock support to `tests/Compare_PAR2_Py/compare.py` as a first-class comparison backend alongside PAR2, RK45 CPU/GPU, RK4 FP, and MODPATH7.
+- Added the `--no-pollock` CLI flag and included Pollock in console summaries, saved `.npz` outputs, figure overlays, and synthetic-case evaluation.
+- Added internal reconstruction of full Pollock face inputs from the script's existing trimmed `QXX`/`QYY`-style arrays.
+- Verified the updated comparison script with a compile check and CLI help output.
+- Updated `README.md` with the Pollock comparison workflow and `compare.py` usage notes.
+
+## 2026-03-12 02:58:23 UTC
+- Refactored `tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py` into a shared runner plus `argparse` CLI for direct execution.
+- Added CLI controls for grid size, `dh`, PETSc tolerances, `output_location`, `align_with_modflow`, `spacing_mode`, `face_output`, figure saving, and output directory.
+- Kept the existing `unittest` path on the old default behavior by routing it through the same runner with default options.
+- Verified the new script syntax and CLI help output.
+- Updated `README.md` with the new MODFLOW vs PETSc comparison CLI usage.
+
 ## 2026-03-12 02:45:48 UTC
 - Fixed RK45 CPU and GPU Dormand-Prince error estimation to evaluate the missing 7th stage at the 5th-order solution before forming the embedded 4th-order estimate.
 - Corrected accepted-step `right_x` crossing handling so CPU/GPU interpolate from the pre-step state instead of the overwritten accepted state.

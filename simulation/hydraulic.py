@@ -23,7 +23,7 @@ def get_spacing_and_faces(coord_centers):
     return d_cell, d_face
 
 
-def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000, spacing_mode="uniform"):
+def solve_head(K, x, y, dh=0.01, rtol=1e-10, atol=1e-10, max_it=10000, spacing_mode="center_faces"):
     """
     Solve ∇·(K∇h) = 0 in a 2D domain with:
     - Dirichlet BCs on left/right: h(left)=dh*x_len, h(right)=0

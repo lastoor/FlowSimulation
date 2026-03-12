@@ -9,6 +9,8 @@ STATUS_MAX_STEPS = np.int32(4)
 
 _HUGE_DT = 1e30
 _EPS = 1e-12
+_NUDGE_REL = 1e-6
+_NUDGE_F32 = 32.0 * np.finfo(np.float32).eps
 
 
 @njit
@@ -31,7 +33,7 @@ def find_cell_index(grid, val):
 
 
 @njit
-def pollock_step(x, y, x_faces, y_faces, vx_faces, vy_faces):
+def _pollock_step_with_hitinfo(x, y, x_faces, y_faces, vx_faces, vy_faces):
     """
     Compute a single analytical step through one cell using full face velocities.
 
@@ -46,13 +48,13 @@ def pollock_step(x, y, x_faces, y_faces, vx_faces, vy_faces):
 
     Returns
     -------
-    x_new, y_new, dt, status
+    x_new, y_new, dt, status, hit_axis, hit_index, hit_direction
     """
     j = find_cell_index(x_faces, x)
     i = find_cell_index(y_faces, y)
 
     if i == -1 or j == -1:
-        return x, y, 0.0, STATUS_OUT_OF_BOUNDS
+        return x, y, 0.0, STATUS_OUT_OF_BOUNDS, -1, -1, 0
 
     x1 = x_faces[j]
     x2 = x_faces[j + 1]
@@ -61,7 +63,7 @@ def pollock_step(x, y, x_faces, y_faces, vx_faces, vy_faces):
     dx = x2 - x1
     dy = y2 - y1
     if dx <= 0.0 or dy <= 0.0:
-        return x, y, 0.0, STATUS_STAGNATION
+        return x, y, 0.0, STATUS_STAGNATION, -1, -1, 0
 
     v1x = vx_faces[i, j]
     v2x = vx_faces[i, j + 1]
@@ -99,7 +101,7 @@ def pollock_step(x, y, x_faces, y_faces, vx_faces, vy_faces):
 
     dt_exit = min(dtx, dty)
     if dt_exit == _HUGE_DT or dt_exit <= _EPS or not np.isfinite(dt_exit):
-        return x, y, 0.0, STATUS_STAGNATION
+        return x, y, 0.0, STATUS_STAGNATION, -1, -1, 0
 
     if abs(ax) > _EPS:
         x_new = x1 + (vpx * np.exp(ax * dt_exit) - v1x) / ax
@@ -112,11 +114,35 @@ def pollock_step(x, y, x_faces, y_faces, vx_faces, vy_faces):
         y_new = y + vpy * dt_exit
 
     if dtx < dty:
-        x_new = x2 if vpx > 0.0 else x1
+        if vpx > 0.0:
+            x_new = x2
+            hit_index = j + 1
+            hit_direction = 1
+        else:
+            x_new = x1
+            hit_index = j
+            hit_direction = -1
+        hit_axis = 0
     else:
-        y_new = y2 if vpy > 0.0 else y1
+        if vpy > 0.0:
+            y_new = y2
+            hit_index = i + 1
+            hit_direction = 1
+        else:
+            y_new = y1
+            hit_index = i
+            hit_direction = -1
+        hit_axis = 1
 
-    return x_new, y_new, dt_exit, STATUS_SUCCESS
+    return x_new, y_new, dt_exit, STATUS_SUCCESS, hit_axis, hit_index, hit_direction
+
+
+@njit
+def pollock_step(x, y, x_faces, y_faces, vx_faces, vy_faces):
+    x_new, y_new, dt_exit, status, _, _, _ = _pollock_step_with_hitinfo(
+        x, y, x_faces, y_faces, vx_faces, vy_faces
+    )
+    return x_new, y_new, dt_exit, status
 
 
 @njit
@@ -134,7 +160,9 @@ def trace_pathline(x0, y0, x_faces, y_faces, vx_faces, vy_faces, max_steps=1000)
     steps = 0
     final_status = STATUS_MAX_STEPS
     for s in range(1, max_steps + 1):
-        curr_x, curr_y, dt, status = pollock_step(
+        prev_x = curr_x
+        prev_y = curr_y
+        curr_x, curr_y, dt, status, hit_axis, hit_index, hit_direction = _pollock_step_with_hitinfo(
             curr_x, curr_y, x_faces, y_faces, vx_faces, vy_faces
         )
         total_time += dt
@@ -150,10 +178,32 @@ def trace_pathline(x0, y0, x_faces, y_faces, vx_faces, vy_faces, max_steps=1000)
         if curr_x <= x_faces[0] or curr_x >= x_faces[-1] or curr_y <= y_faces[0] or curr_y >= y_faces[-1]:
             final_status = STATUS_SUCCESS
             break
+
+        curr_x, curr_y = _nudge_to_next_cell(curr_x, curr_y, x_faces, y_faces, hit_axis, hit_index, hit_direction)
     else:
         final_status = STATUS_MAX_STEPS
 
     return path[:steps + 1], times[:steps + 1], final_status
+
+
+@njit
+def _local_nudge(span, coord):
+    scale = abs(span) * _NUDGE_REL
+    floor = max(abs(coord), 1.0) * _NUDGE_F32
+    return max(scale, floor)
+
+
+@njit
+def _nudge_to_next_cell(curr_x, curr_y, x_faces, y_faces, hit_axis, hit_index, hit_direction):
+    if hit_axis == 0:
+        if 0 < hit_index < x_faces.size - 1:
+            span = x_faces[hit_index] - x_faces[hit_index - 1] if hit_direction > 0 else x_faces[hit_index + 1] - x_faces[hit_index]
+            curr_x += hit_direction * _local_nudge(span, curr_x)
+    elif hit_axis == 1:
+        if 0 < hit_index < y_faces.size - 1:
+            span = y_faces[hit_index] - y_faces[hit_index - 1] if hit_direction > 0 else y_faces[hit_index + 1] - y_faces[hit_index]
+            curr_y += hit_direction * _local_nudge(span, curr_y)
+    return curr_x, curr_y
 
 
 @njit
@@ -179,16 +229,31 @@ def _trace_one_particle(x0, y0, x_faces, y_faces, vx_faces, vy_faces, right_x, m
             status = STATUS_MAX_STEPS
             break
 
-        next_x, next_y, dt, step_status = pollock_step(
+        prev_x = curr_x
+        prev_y = curr_y
+        prev_t = curr_t
+        next_x, next_y, dt, step_status, hit_axis, hit_index, hit_direction = _pollock_step_with_hitinfo(
             curr_x, curr_y, x_faces, y_faces, vx_faces, vy_faces
         )
         if step_status != STATUS_SUCCESS:
             status = step_status
             break
 
-        curr_t += dt
+        curr_t = prev_t + dt
         curr_x = next_x
         curr_y = next_y
+
+        if prev_x < right_x <= curr_x:
+            dx_step = curr_x - prev_x
+            if abs(dx_step) > _EPS:
+                tau = (right_x - prev_x) / dx_step
+                tau = min(max(tau, 0.0), 1.0)
+            else:
+                tau = 1.0
+            curr_x = right_x
+            curr_y = prev_y + tau * (curr_y - prev_y)
+            curr_t = prev_t + tau * dt
+
         px[length] = curr_x
         py[length] = curr_y
         pt[length] = curr_t
@@ -200,6 +265,8 @@ def _trace_one_particle(x0, y0, x_faces, y_faces, vx_faces, vy_faces, right_x, m
         if curr_x <= x_faces[0] or curr_x >= x_faces[-1] or curr_y <= y_faces[0] or curr_y >= y_faces[-1]:
             status = STATUS_SUCCESS
             break
+
+        curr_x, curr_y = _nudge_to_next_cell(curr_x, curr_y, x_faces, y_faces, hit_axis, hit_index, hit_direction)
     else:
         status = STATUS_MAX_STEPS
 

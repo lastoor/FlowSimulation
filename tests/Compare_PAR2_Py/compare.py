@@ -4,6 +4,7 @@ Compare the solved fastest path of a velocity field (from log-fBm conductivity) 
 The velocity field is obtained by solving flow on a log-fBm conductivity field with MODFLOW.
 We then compute the fastest path from source to target on that same velocity field using:
   - PAR2 (external executable)
+  - Pollock (analytical cell-crossing on full face velocities)
   - rk45_cpu (Numba RK45 arclength)
   - rk45_gpu (Numba CUDA RK45 arclength)
   - rk4_fp (Taichi RK4 time stepping)
@@ -11,8 +12,8 @@ We then compute the fastest path from source to target on that same velocity fie
 Workflow:
 1) Generate log-fBm conductivity field.
 2) Solve velocity field with MODFLOW from that conductivity.
-3) Solve fastest path with PAR2, rk45_cpu, rk45_gpu, rk4_fp on the same velocity field.
-4) Compare and visualize the four fastest paths; save figure and npz.
+3) Solve fastest path with PAR2, Pollock, rk45_cpu, rk45_gpu, rk4_fp on the same velocity field.
+4) Compare and visualize the fastest paths; save figure and npz.
 """
 
 import argparse
@@ -35,6 +36,7 @@ from simulation.hydraulic import read_mt3d_file, run_modflow, write_mt3d_file
 from simulation.particle_tracking import (
     fastest_trajectory,
     particle_tracking_cpu,
+    particle_tracking_pollock,
     gpu_track_particles_arclength,
     run_par2,
 )
@@ -141,6 +143,165 @@ def _first_crossing_path(x, y, t, x_cp):
     x_clip = np.concatenate([x[:k], np.array([x_cp], dtype=np.float64)])
     y_clip = np.concatenate([y[:k], np.array([y_cross], dtype=np.float64)])
     return x_clip, y_clip, float(t_cross)
+
+
+def _build_face_coords_from_centers(x_grid, y_grid):
+    """Build face coordinates from 1D center coordinates by midpoint extrapolation."""
+    x_grid = np.asarray(x_grid, dtype=np.float64).ravel()
+    y_grid = np.asarray(y_grid, dtype=np.float64).ravel()
+    if x_grid.size < 2 or y_grid.size < 2:
+        raise ValueError("x_grid and y_grid must each contain at least 2 centers.")
+
+    x_faces = np.empty(x_grid.size + 1, dtype=np.float64)
+    y_faces = np.empty(y_grid.size + 1, dtype=np.float64)
+    x_faces[1:-1] = 0.5 * (x_grid[:-1] + x_grid[1:])
+    y_faces[1:-1] = 0.5 * (y_grid[:-1] + y_grid[1:])
+    x_faces[0] = x_grid[0] - 0.5 * (x_grid[1] - x_grid[0])
+    x_faces[-1] = x_grid[-1] + 0.5 * (x_grid[-1] - x_grid[-2])
+    y_faces[0] = y_grid[0] - 0.5 * (y_grid[1] - y_grid[0])
+    y_faces[-1] = y_grid[-1] + 0.5 * (y_grid[-1] - y_grid[-2])
+    return x_faces.astype(np.float32), y_faces.astype(np.float32)
+
+
+def _build_centers_from_faces(x_faces, y_faces):
+    x_faces = np.asarray(x_faces, dtype=np.float64).ravel()
+    y_faces = np.asarray(y_faces, dtype=np.float64).ravel()
+    if x_faces.size < 2 or y_faces.size < 2:
+        raise ValueError("x_faces and y_faces must each contain at least 2 values.")
+    x_centers = 0.5 * (x_faces[:-1] + x_faces[1:])
+    y_centers = 0.5 * (y_faces[:-1] + y_faces[1:])
+    return x_centers.astype(np.float32), y_centers.astype(np.float32)
+
+
+def _trimmed_face_fields_to_full(vx_trimmed, vy_trimmed):
+    """
+    Convert per-cell right/top face arrays to full staggered face arrays.
+
+    The comparison workflows store `QXX`/`QYY`-style arrays with shape `(ny, nx)`.
+    Pollock needs the full physical face layout:
+      - vx_full: `(ny, nx + 1)`
+      - vy_full: `(ny + 1, nx)`
+    """
+    vx_trimmed = np.asarray(vx_trimmed, dtype=np.float64)
+    vy_trimmed = np.asarray(vy_trimmed, dtype=np.float64)
+    if vx_trimmed.shape != vy_trimmed.shape:
+        raise ValueError("vx_trimmed and vy_trimmed must have the same shape.")
+
+    ny, nx = vx_trimmed.shape
+    vx_full = np.zeros((ny, nx + 1), dtype=np.float64)
+    vy_full = np.zeros((ny + 1, nx), dtype=np.float64)
+    vx_full[:, 1:] = vx_trimmed
+    vy_full[1:, :] = vy_trimmed
+
+    # Reconstruct the missing left/bottom boundary faces by nearest-face extension.
+    vx_full[:, 0] = vx_trimmed[:, 0]
+    vy_full[0, :] = vy_trimmed[0, :]
+    return vx_full, vy_full
+
+
+def _full_face_fields_to_cell(vx_full, vy_full):
+    vx_full = np.asarray(vx_full, dtype=np.float64)
+    vy_full = np.asarray(vy_full, dtype=np.float64)
+    return (
+        0.5 * (vx_full[:, :-1] + vx_full[:, 1:]),
+        0.5 * (vy_full[:-1, :] + vy_full[1:, :]),
+    )
+
+
+def _build_coordinate_mesh(x_coords, y_coords):
+    x_coords = np.asarray(x_coords, dtype=np.float64).ravel()
+    y_coords = np.asarray(y_coords, dtype=np.float64).ravel()
+    return np.broadcast_to(x_coords[None, :], (y_coords.size, x_coords.size)), np.broadcast_to(y_coords[:, None], (y_coords.size, x_coords.size))
+
+
+def _synthetic_lane_specs(nx, ny):
+    return [
+        {"name": "lane0", "y0": 0.28 * ny, "amp": 5.5, "freq": 1.2, "phase": 0.2, "boost": 0.05, "width": 2.4},
+        {"name": "lane1", "y0": 0.52 * ny, "amp": 8.0, "freq": 4.0, "phase": 1.0, "boost": 10.0, "width": 2.2},
+        {"name": "lane2", "y0": 0.72 * ny, "amp": 4.5, "freq": 0.9, "phase": -0.6, "boost": 0.05, "width": 2.6},
+    ]
+
+
+def _synthetic_velocity_from_formula(x_eval, y_eval, nx, ny):
+    """
+    Evaluate the synthetic lane field at arbitrary coordinates.
+
+    Parameters
+    ----------
+    x_eval, y_eval : np.ndarray
+        Arrays with matching shape giving evaluation coordinates in compare.py index space.
+    """
+    x_eval = np.asarray(x_eval, dtype=np.float64)
+    y_eval = np.asarray(y_eval, dtype=np.float64)
+    if x_eval.shape != y_eval.shape:
+        raise ValueError("x_eval and y_eval must have the same shape.")
+
+    base_vx = 0.04
+    vx = np.full(x_eval.shape, base_vx, dtype=np.float64)
+    vy = np.zeros(x_eval.shape, dtype=np.float64)
+    x_period = max(float(nx), 1.0)
+
+    for lane in _synthetic_lane_specs(nx, ny):
+        phase = (2.0 * np.pi * lane["freq"] * x_eval / x_period) + lane["phase"]
+        y_curve = lane["y0"] + lane["amp"] * np.sin(phase)
+        dydx = lane["amp"] * (2.0 * np.pi * lane["freq"] / x_period) * np.cos(phase)
+        dist = y_eval - y_curve
+        width = max(float(lane["width"]), 1e-6)
+        weight = np.exp(-0.5 * (dist / width) ** 2)
+        tangent_norm = np.sqrt(1.0 + dydx * dydx)
+        vx += weight * (lane["boost"] / tangent_norm)
+        vy += weight * (lane["boost"] * dydx / tangent_norm)
+
+    return np.maximum(vx, 1e-8), vy
+
+
+def _build_synthetic_fields(nx, ny, velocity_location):
+    """
+    Build synthetic solver inputs from analytic formulas.
+
+    Returns
+    -------
+    dict
+        Canonical face inputs for Pollock plus the selected non-Pollock representation.
+    """
+    x_centers = np.arange(nx, dtype=np.float64)
+    y_centers = np.arange(ny, dtype=np.float64)
+    x_faces, y_faces = _build_face_coords_from_centers(x_centers, y_centers)
+    x_faces64 = np.asarray(x_faces, dtype=np.float64)
+    y_faces64 = np.asarray(y_faces, dtype=np.float64)
+    x_centers64, y_centers64 = _build_centers_from_faces(x_faces64, y_faces64)
+    x_centers64 = np.asarray(x_centers64, dtype=np.float64)
+    y_centers64 = np.asarray(y_centers64, dtype=np.float64)
+
+    X_vx, Y_vx = _build_coordinate_mesh(x_faces64, y_centers64)
+    vx_full, _ = _synthetic_velocity_from_formula(X_vx, Y_vx, nx, ny)
+    X_vy, Y_vy = _build_coordinate_mesh(x_centers64, y_faces64)
+    _, vy_full = _synthetic_velocity_from_formula(X_vy, Y_vy, nx, ny)
+
+    vx_trim = vx_full[:, 1:]
+    vy_trim = vy_full[1:, :]
+
+    if velocity_location == "face":
+        vx_plot = vx_trim
+        vy_plot = vy_trim
+    elif velocity_location == "cell":
+        X_cell, Y_cell = _build_coordinate_mesh(x_centers64, y_centers64)
+        vx_plot, vy_plot = _synthetic_velocity_from_formula(X_cell, Y_cell, nx, ny)
+    else:
+        raise ValueError("velocity_location must be either 'face' or 'cell'.")
+
+    return {
+        "x_centers": x_centers64.astype(np.float32),
+        "y_centers": y_centers64.astype(np.float32),
+        "x_faces": x_faces64.astype(np.float32),
+        "y_faces": y_faces64.astype(np.float32),
+        "vx_full": vx_full,
+        "vy_full": vy_full,
+        "vx_trim": vx_trim,
+        "vy_trim": vy_trim,
+        "vx_plot": vx_plot,
+        "vy_plot": vy_plot,
+    }
 
 
 def _run_modpath7_and_extract_fastest(path_mp7, path_mfoutput, model_name, x0, y0, y1, nP, x_cp):
@@ -304,6 +465,7 @@ def _save_comparison_figure(
     title,
     vx,
     vy,
+    pollock_res,
     rk45_cpu_res,
     rk45_gpu_res,
     rk4_fp_res,
@@ -312,7 +474,7 @@ def _save_comparison_figure(
     par2_fast,
     expected_lane=None,
 ):
-    """Save a figure comparing PAR2, RK45 CPU/GPU, and RK4 FP fastest paths."""
+    """Save a figure comparing PAR2, Pollock, RK45 CPU/GPU, RK4 FP, and MODPATH7 fastest paths."""
     ny, nx = vx.shape
     x = np.arange(nx)
     y = np.arange(ny)
@@ -355,10 +517,20 @@ def _save_comparison_figure(
         ax.plot(
             expected_lane[:, 0],
             expected_lane[:, 1],
-            color="#FFD700",
+            color="#1A5AE3",
             lw=2.0,
             ls=":",
             label="Expected fastest lane",
+        )
+
+    if pollock_res is not None:
+        ax.plot(
+            pollock_res["x"],
+            pollock_res["y"],
+            color="#FF7F0E",
+            lw=2.0,
+            ls="--",
+            label=f'Fastest Path (Pollock), t={pollock_res["travel_time"]:.3g}',
         )
 
     if rk45_cpu_res is not None:
@@ -368,6 +540,7 @@ def _save_comparison_figure(
             "w--",
             lw=2.0,
             label=f'Fastest Path (RK45 CPU), t={rk45_cpu_res["travel_time"]:.3g}',
+            zorder=10,
         )
 
     if rk45_gpu_res is not None:
@@ -383,7 +556,8 @@ def _save_comparison_figure(
         ax.plot(
             rk4_fp_res["x"],
             rk4_fp_res["y"],
-            "m-",
+            color="#F5F5F5",
+            linestyle="-.",
             lw=2.0,
             label=f'Fastest Path (RK4 FP Taichi), t={rk4_fp_res["travel_time"]:.3g}',
         )
@@ -431,6 +605,12 @@ def _parse_args():
         help="Minimum expected time gap between fastest and second-fastest synthetic lanes.",
     )
     p.add_argument(
+        "--velocity-location",
+        choices=("face", "cell"),
+        default="face",
+        help="Velocity representation used by non-Pollock solvers in the comparison.",
+    )
+    p.add_argument(
         "--no-par2",
         action="store_true",
         help="Do not run PAR2 in the comparison.",
@@ -439,6 +619,11 @@ def _parse_args():
         "--no-rk45-cpu",
         action="store_true",
         help="Do not run RK45 CPU in the comparison.",
+    )
+    p.add_argument(
+        "--no-pollock",
+        action="store_true",
+        help="Do not run Pollock in the comparison.",
     )
     p.add_argument(
         "--no-rk45-gpu",
@@ -457,17 +642,20 @@ def _parse_args():
     )
     args = p.parse_args()
     use_par2 = not args.no_par2
+    use_pollock = not args.no_pollock
     use_rk45_cpu = not args.no_rk45_cpu
     use_rk45_gpu = not args.no_rk45_gpu
     use_rk4_fp = not args.no_rk4_fp
     use_modpath = not args.no_modpath
-    if not (use_par2 or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_modpath):
+    if not (use_par2 or use_pollock or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_modpath):
         p.error("At least one algorithm must be enabled (do not pass all --no-* flags).")
     return argparse.Namespace(
         test_case=args.test_case,
         synthetic_shape_tol=float(args.synthetic_shape_tol),
         synthetic_time_gap_min=float(args.synthetic_time_gap_min),
+        velocity_location=args.velocity_location,
         use_par2=use_par2,
+        use_pollock=use_pollock,
         use_rk45_cpu=use_rk45_cpu,
         use_rk45_gpu=use_rk45_gpu,
         use_rk4_fp=use_rk4_fp,
@@ -493,43 +681,19 @@ def _polyline_travel_time(x_path, y_path, vx, vy):
     return float(np.sum(ds / np.maximum(seg_speed, 1e-12)))
 
 
-def _build_synthetic_velocity_field(nx, ny):
-    """
-    Build a deterministic velocity field with one unique fastest sine-like lane.
-    """
+def _build_synthetic_expected(nx, ny, velocity_location, vx_plot, vy_plot):
+    """Build synthetic expected-lane metrics against the selected solver field."""
     x = np.arange(nx, dtype=np.float64)
-    y = np.arange(ny, dtype=np.float64)
-    Y = np.broadcast_to(y[:, None], (ny, nx))
-
-    base_vx = 0.04
-    vx = np.full((ny, nx), base_vx, dtype=np.float64)
-    vy = np.zeros((ny, nx), dtype=np.float64)
-
-    lanes = [
-        {"name": "lane0", "y0": 0.28 * ny, "amp": 5.5, "freq": 1.2, "phase": 0.2, "boost": 0.05, "width": 2.4},
-        {"name": "lane1", "y0": 0.52 * ny, "amp": 8.0, "freq": 2, "phase": 1.0, "boost": 50, "width": 2.2},
-        {"name": "lane2", "y0": 0.72 * ny, "amp": 4.5, "freq": 0.9, "phase": -0.6, "boost": 0.05, "width": 2.6},
-    ]
-
     lane_paths = []
     lane_times = []
-    for lane in lanes:
-        phase = (2.0 * np.pi * lane["freq"] * x / nx) + lane["phase"]
+    for lane in _synthetic_lane_specs(nx, ny):
+        phase = (2.0 * np.pi * lane["freq"] * x / max(float(nx), 1.0)) + lane["phase"]
         y_curve = lane["y0"] + lane["amp"] * np.sin(phase)
-        dydx = lane["amp"] * (2.0 * np.pi * lane["freq"] / nx) * np.cos(phase)
-        dist = Y - y_curve[None, :]
-        width = max(float(lane["width"]), 1e-6)
-        weight = np.exp(-0.5 * (dist / width) ** 2)
-        tangent_norm = np.sqrt(1.0 + dydx[None, :] ** 2)
-        vx += weight * (lane["boost"] / tangent_norm)
-        vy += weight * (lane["boost"] * dydx[None, :] / tangent_norm)
-
         y_curve = np.clip(y_curve, 0.0, ny - 1.0)
         path = np.column_stack((x, y_curve))
         lane_paths.append(path)
-        lane_times.append(_polyline_travel_time(path[:, 0], path[:, 1], vx, vy))
+        lane_times.append(_polyline_travel_time(path[:, 0], path[:, 1], vx_plot, vy_plot))
 
-    vx = np.maximum(vx, 1e-8)
     lane_times = np.asarray(lane_times, dtype=np.float64)
     order = np.argsort(lane_times)
     fastest_idx = int(order[0])
@@ -540,8 +704,9 @@ def _build_synthetic_velocity_field(nx, ny):
         "fastest_lane_id": fastest_idx,
         "fastest_lane": lane_paths[fastest_idx],
         "second_fastest_time": float(lane_times[second_idx]),
+        "velocity_location": velocity_location,
     }
-    return vx, vy, expected
+    return expected
 
 
 def _downsample_path(path, max_points=2000):
@@ -625,8 +790,14 @@ def _run_case(
     path_mp7,
     source_vertex,
     x_cp,
-    vx,
-    vy,
+    vx_full,
+    vy_full,
+    vx_plot,
+    vy_plot,
+    x_faces,
+    y_faces,
+    x_centers,
+    y_centers,
     dx,
     dy,
     x0,
@@ -650,10 +821,22 @@ def _run_case(
     expected_synthetic=None,
     modpath_model_name=None,
 ):
-    ly, lx = vx.shape
+    vx_full = np.asarray(vx_full, dtype=np.float64)
+    vy_full = np.asarray(vy_full, dtype=np.float64)
+    vx_plot = np.asarray(vx_plot, dtype=np.float64)
+    vy_plot = np.asarray(vy_plot, dtype=np.float64)
+    x_faces = np.asarray(x_faces, dtype=np.float32).ravel()
+    y_faces = np.asarray(y_faces, dtype=np.float32).ravel()
+    x_centers = np.asarray(x_centers, dtype=np.float32).ravel()
+    y_centers = np.asarray(y_centers, dtype=np.float32).ravel()
+
+    ly, lx = vx_plot.shape
+    vx_trim = vx_full[:, 1:]
+    vy_trim = vy_full[1:, :]
+    vx_cell_from_faces, vy_cell_from_faces = _full_face_fields_to_cell(vx_full, vy_full)
     ftl_path = path_mfoutput / ("mf2005_model_modified.ftl" if case_name == "fbm" else "synthetic_velocity.ftl")
 
-    if case_name == "synthetic":
+    if case_name == "synthetic" and opts.velocity_location == "face":
         cnh = []
         for j in range(ly):
             cnh.append([1, j + 1, 1, 1.0e-2])
@@ -661,8 +844,8 @@ def _run_case(
         vars_ftl = {
             "header": " 'MT3D4.00.00'           0           0           0           0           0           0         200           1           1           0           0           0           0           0           0           0           0           0           0           0           0",
             "THKSAT": -111.0 * np.ones((ly, lx), dtype=np.float64),
-            "QXX": np.asarray(vx, dtype=np.float64),
-            "QYY": np.asarray(vy, dtype=np.float64),
+            "QXX": np.asarray(vx_trim, dtype=np.float64),
+            "QYY": np.asarray(vy_trim, dtype=np.float64),
             "CNH": np.asarray(cnh, dtype=np.float64),
         }
         par2_overrides = {
@@ -675,45 +858,55 @@ def _run_case(
         write_mt3d_file(str(ftl_path), vars_ftl)
 
     par2_ok = False
+    par2_ran = False
     if opts.use_par2:
-        par2_overrides = par2_overrides if "par2_overrides" in locals() else {}
-        par2_overrides.update(
-            {
-                "simulation": {
-                    "particles": {"N": nP},
-                    "dt": dt_compare,
-                    "steps": max_steps_compare,
-                },
-                "output": {"debut": {"num": max_traj}},
-            }
-        )
-        update_config_file(
-            str(path_p2input / "par2_config.yaml"),
-            create_par2_config(
-                dx, dy, lx, ly, path_mfoutput, path_p2output, source_vertex, x_cp,
-                overrides=par2_overrides,
-            ),
-        )
-        return_code_p2, return_msg_p2 = run_par2(path_par2, path_p2input, path_p2output)
-        print(return_msg_p2)
-        par2_ok = return_code_p2 in (0, 10, 11)
-        if not par2_ok:
-            print("Warning: PAR2 did not succeed (e.g. no GPU). Continuing with others.")
+        if opts.velocity_location == "cell":
+            print("Warning: PAR2 skipped in cell mode (current compare.py PAR2 path requires face-style QXX/QYY data).")
+        else:
+            par2_ran = True
+            par2_overrides = par2_overrides if "par2_overrides" in locals() else {}
+            par2_overrides.update(
+                {
+                    "simulation": {
+                        "particles": {"N": nP},
+                        "dt": dt_compare,
+                        "steps": max_steps_compare,
+                    },
+                    "output": {"debut": {"num": max_traj}},
+                }
+            )
+            update_config_file(
+                str(path_p2input / "par2_config.yaml"),
+                create_par2_config(
+                    dx, dy, lx, ly, path_mfoutput, path_p2output, source_vertex, x_cp,
+                    overrides=par2_overrides,
+                ),
+            )
+            return_code_p2, return_msg_p2 = run_par2(path_par2, path_p2input, path_p2output)
+            print(return_msg_p2)
+            par2_ok = return_code_p2 in (0, 10, 11)
+            if not par2_ok:
+                print("Warning: PAR2 did not succeed (e.g. no GPU). Continuing with others.")
 
-    x_grid = np.arange(vx.shape[1], dtype=np.float32) * np.float32(dx)
-    y_grid = np.arange(vx.shape[0], dtype=np.float32) * np.float32(dy)
     seeds_x = np.full(nP, x0, dtype=np.float32)
     seeds_y = np.linspace(y0, y1, nP).astype(np.float32)
 
+    if opts.velocity_location == "face":
+        solver_vx = vx_trim
+        solver_vy = vy_trim
+    else:
+        solver_vx = vx_plot
+        solver_vy = vy_plot
+
     args_particle_tracking = {
-        "x": x_grid,
-        "y": y_grid,
-        "vx": np.asarray(vx, dtype=np.float64),
-        "vy": np.asarray(vy, dtype=np.float64),
+        "x": x_centers,
+        "y": y_centers,
+        "vx": np.asarray(solver_vx, dtype=np.float64),
+        "vy": np.asarray(solver_vy, dtype=np.float64),
         "seeds_x": seeds_x,
         "seeds_y": seeds_y,
         "right_x": right_x,
-        "velocity_location": "face",
+        "velocity_location": opts.velocity_location,
         "eps_speed": eps_speed,
         "ds_min": ds_min,
         "ds_max": ds_max,
@@ -724,6 +917,22 @@ def _run_case(
         "dt": dt_compare,
         "max_steps": max_steps_compare,
     }
+    pollock_res = None
+    if opts.use_pollock:
+        pollock_params = {
+            "x_faces": x_faces,
+            "y_faces": y_faces,
+            "vx": vx_full,
+            "vy": vy_full,
+            "seeds_x": seeds_x,
+            "seeds_y": seeds_y,
+            "right_x": right_x,
+            "max_points": max_points,
+            "max_steps": max_steps_compare,
+        }
+        px_p, py_p, pt_p, L_p, st_p = particle_tracking_pollock(pollock_params)
+        pollock_res = fastest_trajectory(px_p, py_p, pt_p, L_p, st_p)
+
     rk45_cpu_res = None
     if opts.use_rk45_cpu:
         px, py, pt, L, st = particle_tracking_cpu(args_particle_tracking)
@@ -783,7 +992,7 @@ def _run_case(
     par2_trajs = []
     par2_fast = None
     par2_fast_time = np.nan
-    if opts.use_par2:
+    if opts.use_par2 and par2_ran and par2_ok:
         path_debut = path_p2output / "debut_trajectory"
         par2_trajs, par2_fast, par2_fast_time = _load_par2_debut_trajectories(path_debut, max_traj=max_traj)
         if par2_fast is None:
@@ -792,6 +1001,8 @@ def _run_case(
     print(f"\n--- Fastest path travel times ({case_name}) ---")
     if opts.use_par2:
         print(f"  PAR2:      {par2_fast_time:.6g}" if np.isfinite(par2_fast_time) else "  PAR2:      (not available)")
+    if opts.use_pollock:
+        print(f"  Pollock:   {pollock_res['travel_time']:.6g}" if pollock_res is not None else "  Pollock:   (skipped)")
     if opts.use_rk45_cpu and rk45_cpu_res is not None:
         print(f"  RK45 CPU:  {rk45_cpu_res['travel_time']:.6g}")
     if opts.use_rk45_gpu:
@@ -804,10 +1015,29 @@ def _run_case(
 
     save_kw = {
         "case_name": np.array([case_name]),
-        "vx": np.asarray(vx, dtype=np.float64),
-        "vy": np.asarray(vy, dtype=np.float64),
+        "velocity_location": np.array([opts.velocity_location]),
+        "vx": np.asarray(vx_plot, dtype=np.float64),
+        "vy": np.asarray(vy_plot, dtype=np.float64),
+        "vx_full": np.asarray(vx_full, dtype=np.float64),
+        "vy_full": np.asarray(vy_full, dtype=np.float64),
+        "x_faces": np.asarray(x_faces, dtype=np.float64),
+        "y_faces": np.asarray(y_faces, dtype=np.float64),
+        "x_centers": np.asarray(x_centers, dtype=np.float64),
+        "y_centers": np.asarray(y_centers, dtype=np.float64),
+        "vx_trim": np.asarray(vx_trim, dtype=np.float64),
+        "vy_trim": np.asarray(vy_trim, dtype=np.float64),
+        "vx_cell_from_faces": np.asarray(vx_cell_from_faces, dtype=np.float64),
+        "vy_cell_from_faces": np.asarray(vy_cell_from_faces, dtype=np.float64),
         "par2_time": par2_fast_time,
     }
+    if pollock_res is not None:
+        save_kw["pollock_x"] = pollock_res["x"]
+        save_kw["pollock_y"] = pollock_res["y"]
+        save_kw["pollock_time"] = pollock_res["travel_time"]
+    else:
+        save_kw["pollock_x"] = np.array([], dtype=np.float64)
+        save_kw["pollock_y"] = np.array([], dtype=np.float64)
+        save_kw["pollock_time"] = np.nan
     if rk45_cpu_res is not None:
         save_kw["rk45_cpu_x"] = rk45_cpu_res["x"]
         save_kw["rk45_cpu_y"] = rk45_cpu_res["y"]
@@ -859,6 +1089,7 @@ def _run_case(
             expected_synthetic,
             {
                 "PAR2": None if par2_fast is None else {"x": par2_fast[:, 0], "y": par2_fast[:, 1], "travel_time": par2_fast_time},
+                "Pollock": pollock_res,
                 "RK45 CPU": rk45_cpu_res,
                 "RK45 GPU": rk45_gpu_res,
                 "RK4 FP": rk4_fp_res,
@@ -881,8 +1112,9 @@ def _run_case(
         background_field=background_field,
         background_label=background_label,
         title=title,
-        vx=vx,
-        vy=vy,
+        vx=vx_plot,
+        vy=vy_plot,
+        pollock_res=pollock_res,
         rk45_cpu_res=rk45_cpu_res,
         rk45_gpu_res=rk45_gpu_res,
         rk4_fp_res=rk4_fp_res,
@@ -897,8 +1129,9 @@ def _run_case(
             background_field=background_field,
             background_label=background_label,
             title=title,
-            vx=vx,
-            vy=vy,
+            vx=vx_plot,
+            vy=vy_plot,
+            pollock_res=pollock_res,
             rk45_cpu_res=rk45_cpu_res,
             rk45_gpu_res=rk45_gpu_res,
             rk4_fp_res=rk4_fp_res,
@@ -1001,8 +1234,17 @@ def main():
         velocity_field = read_mt3d_file(str(path_mfoutput / "mf2005_model_modified.ftl"))
         if "QXX" not in velocity_field or "QYY" not in velocity_field:
             raise KeyError("FTL file does not contain expected QXX/QYY velocity fields.")
-        vx_fbm = velocity_field["QXX"]
-        vy_fbm = velocity_field["QYY"]
+        vx_trim_fbm = np.asarray(velocity_field["QXX"], dtype=np.float64)
+        vy_trim_fbm = np.asarray(velocity_field["QYY"], dtype=np.float64)
+        vx_full_fbm, vy_full_fbm = _trimmed_face_fields_to_full(vx_trim_fbm, vy_trim_fbm)
+        x_centers_fbm = np.arange(vx_trim_fbm.shape[1], dtype=np.float32) * np.float32(dx)
+        y_centers_fbm = np.arange(vx_trim_fbm.shape[0], dtype=np.float32) * np.float32(dy)
+        x_faces_fbm, y_faces_fbm = _build_face_coords_from_centers(x_centers_fbm, y_centers_fbm)
+        if opts.velocity_location == "face":
+            vx_plot_fbm = vx_trim_fbm
+            vy_plot_fbm = vy_trim_fbm
+        else:
+            vx_plot_fbm, vy_plot_fbm = _full_face_fields_to_cell(vx_full_fbm, vy_full_fbm)
 
         _run_case(
             case_name="fbm",
@@ -1015,8 +1257,14 @@ def main():
             path_mp7=path_mp7,
             source_vertex=source_vertex,
             x_cp=x_cp,
-            vx=vx_fbm,
-            vy=vy_fbm,
+            vx_full=vx_full_fbm,
+            vy_full=vy_full_fbm,
+            vx_plot=vx_plot_fbm,
+            vy_plot=vy_plot_fbm,
+            x_faces=x_faces_fbm,
+            y_faces=y_faces_fbm,
+            x_centers=x_centers_fbm,
+            y_centers=y_centers_fbm,
             dx=dx,
             dy=dy,
             x0=x0,
@@ -1036,31 +1284,24 @@ def main():
             max_traj=max_traj,
             background_field=logk_field / np.log(10.0),
             background_label="log10 K",
-            title="Fastest path (velocity from log-fBm conductivity): PAR2 vs RK45 CPU/GPU vs RK4 FP vs MODPATH7",
+            title=f"Fastest path (velocity from log-fBm conductivity, {opts.velocity_location} mode): PAR2 vs Pollock vs RK45 CPU/GPU vs RK4 FP vs MODPATH7",
             expected_synthetic=None,
             modpath_model_name="mf2005_model",
         )
 
     if run_synthetic:
-        vx_syn, vy_syn, expected = _build_synthetic_velocity_field(nx=lx, ny=ly)
+        syn = _build_synthetic_fields(nx=lx, ny=ly, velocity_location=opts.velocity_location)
+        expected = _build_synthetic_expected(
+            nx=lx,
+            ny=ly,
+            velocity_location=opts.velocity_location,
+            vx_plot=syn["vx_plot"],
+            vy_plot=syn["vy_plot"],
+        )
         if (expected["second_fastest_time"] - expected["lane_times"][expected["fastest_lane_id"]]) <= opts.synthetic_time_gap_min:
             raise RuntimeError(
                 "Synthetic field does not satisfy unique fastest lane under current --synthetic-time-gap-min."
             )
-    
-        ftl_path = path_mfoutput / "synthetic_velocity.ftl"
-        cnh = []
-        for j in range(ly):
-            cnh.append([1, j + 1, 1, 1.0e-2])
-            cnh.append([1, j + 1, lx, 0.0])
-        vars_ftl = {
-            "header": " 'MT3D4.00.00'           0           0           0           0           0           0         200           1           1           0           0           0           0           0           0           0           0           0           0           0           0",
-            "THKSAT": -111.0 * np.ones((ly, lx), dtype=np.float64),
-            "QXX": np.asarray(vx_syn, dtype=np.float64),
-            "QYY": np.asarray(vy_syn, dtype=np.float64),
-            "CNH": np.asarray(cnh, dtype=np.float64),
-        }
-        write_mt3d_file(str(ftl_path), vars_ftl)
 
         _run_case(
             case_name="synthetic",
@@ -1073,8 +1314,14 @@ def main():
             path_mp7=path_mp7,
             source_vertex=source_vertex,
             x_cp=x_cp,
-            vx=vx_syn,
-            vy=vy_syn,
+            vx_full=syn["vx_full"],
+            vy_full=syn["vy_full"],
+            vx_plot=syn["vx_plot"],
+            vy_plot=syn["vy_plot"],
+            x_faces=syn["x_faces"],
+            y_faces=syn["y_faces"],
+            x_centers=syn["x_centers"],
+            y_centers=syn["y_centers"],
             dx=dx,
             dy=dy,
             x0=x0,
@@ -1092,9 +1339,9 @@ def main():
             max_points=max_points,
             max_iters=max_iters,
             max_traj=max_traj,
-            background_field=np.sqrt(vx_syn * vx_syn + vy_syn * vy_syn),
+            background_field=np.sqrt(syn["vx_plot"] * syn["vx_plot"] + syn["vy_plot"] * syn["vy_plot"]),
             background_label="|v|",
-            title="Fastest path on synthetic velocity field: PAR2 vs RK45 CPU/GPU vs RK4 FP",
+            title=f"Fastest path on synthetic velocity field ({opts.velocity_location} mode): PAR2 vs Pollock vs RK45 CPU/GPU vs RK4 FP",
             expected_synthetic=expected,
             modpath_model_name=None,
         )
