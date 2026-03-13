@@ -6,6 +6,8 @@ Unit tests for particle_tracking.py
 import sys
 import os
 import unittest
+import warnings
+from unittest import mock
 import numpy as np
 
 # Add parent directory to path
@@ -517,6 +519,85 @@ class TestParticleTracking(unittest.TestCase):
         self.assertEqual(summary["method"], "rk45")
         self.assertGreaterEqual(summary["n_arrived"], 1)
 
+    def test_particle_tracking_summary_pollock_gpu_internal_right_x(self):
+        x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 3), dtype=np.float32)
+        vy = np.zeros((3, 2), dtype=np.float32)
+        right_x = np.float32(0.8)
+
+        try:
+            summary = particle_tracking.particle_tracking_summary(
+                {
+                    "backend": "gpu",
+                    "method": "pollock",
+                    "tracking_mode": "arrival",
+                    "stop_mode": "first",
+                    "save_trajectories": True,
+                    "return_fastest": True,
+                    "x_faces": x_faces,
+                    "y_faces": y_faces,
+                    "vx": vx,
+                    "vy": vy,
+                    "seeds_x": np.array([0.25], dtype=np.float32),
+                    "seeds_y": np.array([0.5], dtype=np.float32),
+                    "right_x": right_x,
+                    "max_points": 8,
+                    "max_steps": 8,
+                }
+            )
+        except Exception as exc:
+            self.skipTest(f"Pollock GPU summary unavailable in this environment: {exc}")
+
+        self.assertEqual(summary["stopping_particle_id"], 0)
+        self.assertAlmostEqual(summary["stopping_travel_time"], right_x - 0.25, delta=2e-5)
+        self.assertAlmostEqual(summary["fastest"]["x"][-1], right_x, places=6)
+        self.assertAlmostEqual(summary["fastest"]["y"][-1], 0.5, places=6)
+
+    def test_pollock_gpu_warns_when_taichi_gpu_falls_back(self):
+        try:
+            import taichi  # noqa: F401
+            from simulation.particle_tracking import pollock_gpu
+        except Exception as exc:
+            self.skipTest(f"Taichi unavailable in this environment: {exc}")
+
+        with mock.patch.object(pollock_gpu, "_ti_initialized", False):
+            with mock.patch("taichi.init", side_effect=[RuntimeError("gpu unavailable"), None]) as init_mock:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    pollock_gpu._ensure_ti_init()
+
+        self.assertEqual(init_mock.call_count, 2)
+        self.assertTrue(any("falling back to Taichi CPU backend" in str(w.message) for w in caught))
+
+    def test_pollock_gpu_tracker_rerun_resets_to_seeds(self):
+        try:
+            from simulation.particle_tracking import pollock_gpu
+        except Exception as exc:
+            self.skipTest(f"Pollock GPU module unavailable in this environment: {exc}")
+
+        x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 3), dtype=np.float32)
+        vy = np.zeros((3, 2), dtype=np.float32)
+        seeds_x = np.array([0.25], dtype=np.float32)
+        seeds_y = np.array([0.5], dtype=np.float32)
+        right_x = np.float32(0.8)
+
+        try:
+            pollock_gpu._ensure_ti_init()
+            tracker_cls = pollock_gpu._make_pollock_tracker()
+            tracker = tracker_cls(x_faces, y_faces, vx, vy, seeds_x, seeds_y, right_x, 8)
+            times1, status1 = tracker.run()
+            times2, status2 = tracker.run()
+        except Exception as exc:
+            self.skipTest(f"Pollock GPU tracker unavailable in this environment: {exc}")
+
+        self.assertEqual(status1[0], 0)
+        self.assertEqual(status2[0], 0)
+        self.assertAlmostEqual(times1[0], right_x - seeds_x[0], delta=2e-5)
+        self.assertAlmostEqual(times2[0], right_x - seeds_x[0], delta=2e-5)
+
     def test_particle_tracking_summary_invalid_method_backend(self):
         """Unsupported method/backend combinations should fail clearly."""
         with self.assertRaises(ValueError):
@@ -699,6 +780,33 @@ class TestParticleTracking(unittest.TestCase):
             self.assertAlmostEqual(py[i, 0], py[i, L[i] - 1], places=6)
             self.assertAlmostEqual(pt[i, L[i] - 1], x_faces[-1] - seeds_x[i], delta=2e-5)
 
+    def test_particle_tracking_pollock_stops_exactly_at_internal_right_x(self):
+        x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 3), dtype=np.float32)
+        vy = np.zeros((3, 2), dtype=np.float32)
+        right_x = np.float32(0.8)
+
+        params = {
+            "x_faces": x_faces,
+            "y_faces": y_faces,
+            "vx": vx,
+            "vy": vy,
+            "seeds_x": np.array([0.25], dtype=np.float32),
+            "seeds_y": np.array([0.5], dtype=np.float32),
+            "right_x": right_x,
+            "max_points": 8,
+            "max_steps": 8,
+        }
+
+        px, py, pt, L, st = particle_tracking.particle_tracking_pollock(params)
+
+        self.assertEqual(st[0], 0)
+        self.assertEqual(L[0], 2)
+        self.assertAlmostEqual(px[0, 1], right_x, places=6)
+        self.assertAlmostEqual(py[0, 1], 0.5, places=6)
+        self.assertAlmostEqual(pt[0, 1], right_x - 0.25, delta=2e-5)
+
     def test_particle_tracking_pollock_zero_velocity_stagnates(self):
         x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
         y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
@@ -723,6 +831,30 @@ class TestParticleTracking(unittest.TestCase):
         self.assertAlmostEqual(px[0, 0], 0.5, places=6)
         self.assertAlmostEqual(py[0, 0], 0.5, places=6)
         self.assertAlmostEqual(pt[0, 0], 0.0, places=6)
+
+    def test_particle_tracking_pollock_near_zero_velocity_stagnates(self):
+        x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.full((2, 3), 1e-20, dtype=np.float32)
+        vy = np.zeros((3, 2), dtype=np.float32)
+
+        params = {
+            "x_faces": x_faces,
+            "y_faces": y_faces,
+            "vx": vx,
+            "vy": vy,
+            "seeds_x": np.array([0.5], dtype=np.float32),
+            "seeds_y": np.array([0.5], dtype=np.float32),
+            "max_points": 8,
+            "max_steps": 8,
+        }
+
+        px, py, pt, L, st = particle_tracking.particle_tracking_pollock(params)
+
+        self.assertEqual(st[0], 1)
+        self.assertEqual(L[0], 1)
+        self.assertAlmostEqual(px[0, 0], 0.5, places=6)
+        self.assertAlmostEqual(py[0, 0], 0.5, places=6)
 
     def test_particle_tracking_pollock_invalid_shapes(self):
         params = {
@@ -761,6 +893,40 @@ class TestParticleTracking(unittest.TestCase):
         self.assertEqual(res["particle_id"], 1)
         self.assertAlmostEqual(res["travel_time"], 2.5, delta=2e-5)
         self.assertAlmostEqual(res["x"][-1], x_faces[-1], places=6)
+
+    def test_particle_tracking_pollock_summary_arrival_mode_skips_dense_arrays(self):
+        x_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 3), dtype=np.float32)
+        vy = np.zeros((3, 2), dtype=np.float32)
+
+        result = particle_tracking.particle_tracking_summary(
+            {
+                "backend": "cpu",
+                "method": "pollock",
+                "tracking_mode": "arrival",
+                "stop_mode": "first",
+                "save_trajectories": False,
+                "return_fastest": True,
+                "x_faces": x_faces,
+                "y_faces": y_faces,
+                "vx": vx,
+                "vy": vy,
+                "seeds_x": np.array([0.0, 0.5], dtype=np.float32),
+                "seeds_y": np.array([0.25, 1.25], dtype=np.float32),
+                "right_x": x_faces[-1],
+                "max_points": 8,
+                "max_steps": 8,
+            }
+        )
+
+        self.assertNotIn("px", result)
+        self.assertNotIn("py", result)
+        self.assertNotIn("pt", result)
+        self.assertEqual(result["stopping_particle_id"], 1)
+        self.assertAlmostEqual(result["stopping_travel_time"], 1.5, delta=2e-5)
+        self.assertEqual(result["fastest"]["particle_id"], 1)
+        self.assertAlmostEqual(result["fastest"]["x"][-1], x_faces[-1], places=6)
 
 
 if __name__ == '__main__':

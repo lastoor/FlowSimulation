@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from .pollock import particle_tracking_pollock_summary
+from .pollock_cpu import particle_tracking_pollock_summary
 from .pollock_gpu import particle_tracking_pollock_gpu_summary
 from .rk45_cpu import particle_tracking_cpu_summary
 from .utils import (

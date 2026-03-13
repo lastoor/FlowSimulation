@@ -10,7 +10,7 @@ Use this package as before:
   particle_tracking.gpu_track_particles_arclength(...)
 
 Or import submodules explicitly:
-  from simulation.particle_tracking import rk45_cpu, pollock, par2, rk45_gpu
+  from simulation.particle_tracking import rk45_cpu, pollock_cpu, pollock_gpu, par2, rk45_gpu
 """
 
 from .rk45_cpu import (
@@ -22,7 +22,7 @@ from .rk45_cpu import (
     particle_tracking_cpu,
     particle_tracking_cpu_summary,
 )
-from .pollock import (
+from .pollock_cpu import (
     pollock_step,
     trace_pathline,
     particle_tracking_pollock,

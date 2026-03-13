@@ -1,5 +1,28 @@
 # Agent Log
 
+## 2026-03-13 01:20:00 UTC
+- Split Pollock into a shared core plus explicit CPU/GPU backend modules: added `simulation/particle_tracking/pollock_core.py`, moved the CPU implementation into `simulation/particle_tracking/pollock_cpu.py`, and kept `simulation/particle_tracking/pollock.py` as a compatibility shim.
+- Centralized Pollock status codes, numerical thresholds, and common input parsing so the CPU and GPU backends now share one source of truth for those behaviors.
+- Updated GPU Pollock to warn when Taichi GPU initialization fails and it falls back to the Taichi CPU backend.
+- Fixed GPU Pollock tracker reruns by restoring particle positions from stored seed fields during `init_state()`.
+- Added particle-tracking tests for Taichi fallback warnings, cached GPU tracker reruns, and explicit near-zero Pollock stagnation behavior.
+- Reverified the particle-tracking test module with `python tests/test_particle_tracking.py` and rechecked the touched modules with `python -m py_compile`.
+- Updated `README.md` to document the new Pollock module layout, explicit Taichi fallback warning, and the remaining Pollock status-code limitation.
+
+## 2026-03-13 01:28:00 UTC
+- Removed the now-unneeded `simulation/particle_tracking/pollock.py` compatibility shim after confirming the repo no longer imports that submodule directly.
+- Kept the public package-level Pollock API unchanged through `simulation/particle_tracking/__init__.py`, which already exports the CPU backend from `pollock_cpu.py`.
+- Updated `README.md` so the documented Pollock module layout no longer mentions the deleted shim.
+
+## 2026-03-13 00:55:00 UTC
+- Optimized Pollock CPU tracking by splitting arrival-only and dense-trajectory execution paths and parallelizing both with Numba `prange`.
+- Removed the old Python-driven Taichi step loop from GPU Pollock and moved full per-particle tracking into a single kernel launch.
+- Changed Pollock CPU/GPU analytical stepping so forward exits target `min(x_face, right_x)` directly, eliminating the outer-loop linear clipping hack and making in-cell `right_x` capture exact.
+- Kept the public summary API unchanged while making Pollock arrival mode lighter-weight internally and retaining replay-only trajectory reconstruction for selected particles.
+- Added Pollock regression tests for exact in-cell `right_x` capture, arrival-only summary mode without dense arrays, and GPU Pollock capture parity.
+- Reverified the particle-tracking test module with `python tests/test_particle_tracking.py`.
+- Updated `README.md` to document the new Pollock execution behavior and narrowed the remaining arrival-mode limitation note to the still-unoptimized RK45 GPU path.
+
 ## 2026-03-13 00:25:00 UTC
 - Made `particle_tracking_summary(params)` the canonical high-level particle-tracking return path for the live runtime flow.
 - Added `return_fastest` to the summary API so particle tracking can directly include or omit the fastest-path payload without a separate reduction step.

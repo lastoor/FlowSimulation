@@ -24,7 +24,7 @@ Typical runtime dependencies include:
 - `numpy`, `scipy`
 - `petsc4py`
 - `numba`
-- `taichi` (for RK4 GPU path in `scripts/run.py`)
+- `taichi` (for RK4 GPU and Pollock GPU summary paths)
 - Optional: CUDA-capable environment and `nvidia-smi`
 
 ## Run the new hybrid script
@@ -123,6 +123,7 @@ Per-MC file:
 ## Pollock Backend
 - `simulation.particle_tracking.particle_tracking_pollock(params)` is available as a first-class particle-tracking backend.
 - `simulation.particle_tracking.particle_tracking_summary(params)` also supports `method="pollock", backend="gpu"` for Taichi-based arrival/summary execution with optional replay of selected trajectories.
+- The CPU implementation now lives in `simulation/particle_tracking/pollock_cpu.py`, with shared Pollock constants/input parsing in `simulation/particle_tracking/pollock_core.py`.
 - Pollock requires explicit face coordinates and full staggered face velocities:
   - `x_faces`: shape `(nx + 1,)`
   - `y_faces`: shape `(ny + 1,)`
@@ -131,6 +132,10 @@ Per-MC file:
 - The expected velocity input matches `simulation.hydraulic.compute_velocity(..., output_location="face", face_output="full")`.
 - Pollock returns the same batched trajectory contract as RK45: `px, py, pt, L, st`, so `fastest_trajectory(...)` works without adapters.
 - Low-level helpers `pollock_step(...)` and `trace_pathline(...)` remain available for direct analytical tracing.
+- CPU Pollock now splits arrival-only and trajectory modes internally: arrival summaries avoid dense `(n_particles, max_points)` path storage, while the legacy tuple API still returns full paths.
+- GPU Pollock now tracks each particle to completion inside a single Taichi kernel launch instead of looping step-by-step from Python.
+- Pollock capture at `right_x` is now handled analytically inside the per-cell step, so particles stop exactly on an in-cell target boundary instead of being linearly clipped afterward.
+- If Taichi GPU initialization fails, Pollock GPU now emits a warning before falling back to the Taichi CPU backend.
 
 Example:
 ```python
@@ -214,7 +219,8 @@ python tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py \
 4. GPU particle tracking is currently split across two stacks: RK45 GPU uses `numba.cuda`, while RK4 GPU uses `taichi`. This means different runtime dependencies, initialization behavior, debugging workflows, and likely different performance/portability characteristics.
 5. The method/backend support matrix is still asymmetric: `pollock` now supports CPU and GPU, `rk45` supports CPU and GPU, but `rk4` is still exposed as GPU-only. A longer-term cleanup would make CPU/GPU availability consistent across all three methods.
 6. Pollock’s public API is still more specialized than RK45/RK4: it consumes `x_faces`, `y_faces`, and full staggered face velocities directly, while RK45/RK4 use the more generic `x/y + vx/vy (+ velocity_location)` interface. A shared adapter layer would reduce this split.
-7. `tracking_mode="arrival"` improves the returned interface, but not all underlying implementations are fully optimized for arrival-only workloads yet. In particular, the current RK45 GPU summary path still wraps the existing full-trajectory CUDA kernel, so memory use is not yet minimized there.
+7. `tracking_mode="arrival"` is now implemented efficiently for Pollock CPU/GPU, but not all underlying implementations are fully optimized for arrival-only workloads yet. In particular, the current RK45 GPU summary path still wraps the existing full-trajectory CUDA kernel, so memory use is not yet minimized there.
 8. GPU RK4/Taichi and GPU Pollock/Taichi trajectory replay are still limited compared with the CPU tuple-based paths: they are currently intended for selected trajectories rather than full-trajectory retention for the entire particle population.
 9. The end-to-end Monte Carlo flow in `simulation/main.py` still assumes a fastest-trajectory workflow for FP geometry checks. The new arrival/fraction/full-BTC summary modes exist, but the main simulation loop is not yet fully redesigned around breakthrough-curve analysis.
 10. The legacy tuple-returning particle-tracking APIs and `fastest_trajectory(...)` helper still exist for compatibility, so there is still some duplication in the public surface even though the live runtime flow now uses the direct-return summary path.
+11. Pollock still treats “captured at `right_x`” and “exited the domain through another boundary” under the same success status code. Arrival summaries still use travel-time/selection logic correctly, but a future cleanup could separate those outcomes more explicitly.

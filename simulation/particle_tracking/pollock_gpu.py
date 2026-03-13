@@ -1,17 +1,27 @@
 """Taichi-based GPU Pollock particle-tracking summary backend."""
 
+import warnings
+
 import numpy as np
 
-from .pollock import (
+from .pollock_core import (
+    POLLOCK_EPS,
+    POLLOCK_HUGE_DT,
+    POLLOCK_NUDGE_F32,
+    POLLOCK_NUDGE_REL,
     STATUS_MAX_STEPS,
     STATUS_OUT_OF_BOUNDS,
     STATUS_STAGNATION,
     STATUS_SUCCESS,
+    parse_pollock_inputs,
+)
+from .pollock_cpu import (
     _trace_one_particle,
 )
 from .utils import build_fastest_result_from_trajectory, fastest_particle_id, summarize_arrivals
 
 _ti_initialized = False
+_tracker_cls = None
 
 
 def _ensure_ti_init():
@@ -22,18 +32,21 @@ def _ensure_ti_init():
 
     try:
         ti.init(arch=ti.gpu, verbose=False)
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"Taichi GPU initialization failed; falling back to Taichi CPU backend ({exc}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         ti.init(arch=ti.cpu, verbose=False)
     _ti_initialized = True
 
 
 def _make_pollock_tracker():
+    global _tracker_cls
+    if _tracker_cls is not None:
+        return _tracker_cls
     import taichi as ti
-
-    HUGE_DT = 1e30
-    EPS = 1e-12
-    NUDGE_REL = 1e-6
-    NUDGE_F32 = np.float32(32.0 * np.finfo(np.float32).eps)
 
     @ti.data_oriented
     class PollockTracking2D:
@@ -63,14 +76,16 @@ def _make_pollock_tracker():
             self.vx_faces.from_numpy(vx_faces)
             self.vy_faces.from_numpy(vy_faces)
 
+            self.seed_x = ti.field(dtype=ti.f32, shape=self.n_particles)
+            self.seed_y = ti.field(dtype=ti.f32, shape=self.n_particles)
             self.pos_x = ti.field(dtype=ti.f32, shape=self.n_particles)
             self.pos_y = ti.field(dtype=ti.f32, shape=self.n_particles)
             self.elapsed = ti.field(dtype=ti.f32, shape=self.n_particles)
             self.final_times = ti.field(dtype=ti.f32, shape=self.n_particles)
             self.status = ti.field(dtype=ti.i32, shape=self.n_particles)
             self.active = ti.field(dtype=ti.i32, shape=self.n_particles)
-            self.active_count = ti.field(dtype=ti.i32, shape=())
-
+            self.seed_x.from_numpy(seeds_x)
+            self.seed_y.from_numpy(seeds_y)
             self.pos_x.from_numpy(seeds_x)
             self.pos_y.from_numpy(seeds_y)
             self._seeds_x = seeds_x.copy()
@@ -99,8 +114,8 @@ def _make_pollock_tracker():
 
         @ti.func
         def _local_nudge(self, span, coord):
-            scale = ti.abs(span) * NUDGE_REL
-            floor = ti.max(ti.abs(coord), 1.0) * NUDGE_F32
+            scale = ti.abs(span) * POLLOCK_NUDGE_REL
+            floor = ti.max(ti.abs(coord), 1.0) * POLLOCK_NUDGE_F32
             return ti.max(scale, floor)
 
         @ti.func
@@ -152,44 +167,47 @@ def _make_pollock_tracker():
             vpx = v1x + ax * (x - x1)
             vpy = v1y + ay * (y - y1)
 
-            dtx = HUGE_DT
-            if vpx > EPS and v2x > EPS:
-                if ti.abs(ax) > EPS:
-                    dtx = ti.log(v2x / vpx) / ax
+            target_x = x2
+            dtx = POLLOCK_HUGE_DT
+            if vpx > POLLOCK_EPS and v2x > POLLOCK_EPS:
+                target_x = ti.min(x2, self.right_x)
+                v_target = v1x + ax * (target_x - x1)
+                if ti.abs(ax) > POLLOCK_EPS:
+                    dtx = ti.log(v_target / vpx) / ax
                 else:
-                    dtx = (x2 - x) / vpx
-            elif vpx < -EPS and v1x < -EPS:
-                if ti.abs(ax) > EPS:
+                    dtx = (target_x - x) / vpx
+            elif vpx < -POLLOCK_EPS and v1x < -POLLOCK_EPS:
+                if ti.abs(ax) > POLLOCK_EPS:
                     dtx = ti.log(v1x / vpx) / ax
                 else:
                     dtx = (x1 - x) / vpx
 
-            dty = HUGE_DT
-            if vpy > EPS and v2y > EPS:
-                if ti.abs(ay) > EPS:
+            dty = POLLOCK_HUGE_DT
+            if vpy > POLLOCK_EPS and v2y > POLLOCK_EPS:
+                if ti.abs(ay) > POLLOCK_EPS:
                     dty = ti.log(v2y / vpy) / ay
                 else:
                     dty = (y2 - y) / vpy
-            elif vpy < -EPS and v1y < -EPS:
-                if ti.abs(ay) > EPS:
+            elif vpy < -POLLOCK_EPS and v1y < -POLLOCK_EPS:
+                if ti.abs(ay) > POLLOCK_EPS:
                     dty = ti.log(v1y / vpy) / ay
                 else:
                     dty = (y1 - y) / vpy
 
             dt_exit = ti.min(dtx, dty)
-            if dt_exit == HUGE_DT or dt_exit <= EPS or ti.math.isnan(dt_exit):
+            if dt_exit == POLLOCK_HUGE_DT or dt_exit <= POLLOCK_EPS or ti.math.isnan(dt_exit):
                 return x, y, 0.0, STATUS_STAGNATION, hit_axis, hit_index, hit_direction
 
             x_new = x + vpx * dt_exit
             y_new = y + vpy * dt_exit
-            if ti.abs(ax) > EPS:
+            if ti.abs(ax) > POLLOCK_EPS:
                 x_new = x1 + (vpx * ti.exp(ax * dt_exit) - v1x) / ax
-            if ti.abs(ay) > EPS:
+            if ti.abs(ay) > POLLOCK_EPS:
                 y_new = y1 + (vpy * ti.exp(ay * dt_exit) - v1y) / ay
 
             if dtx < dty:
                 if vpx > 0.0:
-                    x_new = x2
+                    x_new = target_x
                     hit_index = j + 1
                     hit_direction = 1
                 else:
@@ -213,8 +231,10 @@ def _make_pollock_tracker():
         @ti.kernel
         def init_state(self):
             for i in range(self.n_particles):
+                self.pos_x[i] = self.seed_x[i]
+                self.pos_y[i] = self.seed_y[i]
                 self.elapsed[i] = 0.0
-                self.final_times[i] = 1e30
+                self.final_times[i] = POLLOCK_HUGE_DT
                 self.status[i] = STATUS_MAX_STEPS
                 self.active[i] = 1
                 if self.pos_x[i] >= self.right_x:
@@ -223,9 +243,10 @@ def _make_pollock_tracker():
                     self.active[i] = 0
 
         @ti.kernel
-        def step(self):
+        def track_all(self):
             for i in range(self.n_particles):
-                if self.active[i] == 1:
+                steps = 0
+                while self.active[i] == 1 and steps < self.max_steps:
                     prev_x = self.pos_x[i]
                     prev_y = self.pos_y[i]
                     prev_t = self.elapsed[i]
@@ -239,16 +260,6 @@ def _make_pollock_tracker():
                         curr_t = prev_t + dt
                         curr_x = next_x
                         curr_y = next_y
-
-                        if prev_x < self.right_x and self.right_x <= curr_x:
-                            dx_step = curr_x - prev_x
-                            tau = 1.0
-                            if ti.abs(dx_step) > EPS:
-                                tau = (self.right_x - prev_x) / dx_step
-                                tau = ti.min(ti.max(tau, 0.0), 1.0)
-                            curr_x = self.right_x
-                            curr_y = prev_y + tau * (curr_y - prev_y)
-                            curr_t = prev_t + tau * dt
 
                         self.pos_x[i] = curr_x
                         self.pos_y[i] = curr_y
@@ -271,15 +282,16 @@ def _make_pollock_tracker():
                             nudged_x, nudged_y = self._nudge_to_next_cell(curr_x, curr_y, hit_axis, hit_index, hit_direction)
                             self.pos_x[i] = nudged_x
                             self.pos_y[i] = nudged_y
-                            ti.atomic_add(self.active_count[None], 1)
+                    steps += 1
+
+                if self.active[i] == 1:
+                    self.status[i] = STATUS_MAX_STEPS
+                    self.final_times[i] = self.elapsed[i]
+                    self.active[i] = 0
 
         def run(self):
             self.init_state()
-            for _ in range(self.max_steps):
-                self.active_count[None] = 0
-                self.step()
-                if self.active_count[None] == 0:
-                    break
+            self.track_all()
             import taichi as ti
 
             ti.sync()
@@ -309,7 +321,8 @@ def _make_pollock_tracker():
                 )
             return trajectories
 
-    return PollockTracking2D
+    _tracker_cls = PollockTracking2D
+    return _tracker_cls
 
 
 def particle_tracking_pollock_gpu_summary(params):
@@ -327,24 +340,7 @@ def particle_tracking_pollock_gpu_summary(params):
     if save_trajectories and stop_mode not in ("first", "fraction"):
         raise NotImplementedError("GPU Pollock selected-trajectory replay currently supports stop_mode in {'first', 'fraction'} only.")
 
-    x_faces = np.asarray(params["x_faces"], dtype=np.float32).ravel()
-    y_faces = np.asarray(params["y_faces"], dtype=np.float32).ravel()
-    vx = np.asarray(params["vx"], dtype=np.float32)
-    vy = np.asarray(params["vy"], dtype=np.float32)
-    seeds_x = np.asarray(params["seeds_x"], dtype=np.float32).ravel()
-    seeds_y = np.asarray(params["seeds_y"], dtype=np.float32).ravel()
-    if vx.shape != (y_faces.size - 1, x_faces.size):
-        raise ValueError("vx shape must be (len(y_faces)-1, len(x_faces)).")
-    if vy.shape != (y_faces.size, x_faces.size - 1):
-        raise ValueError("vy shape must be (len(y_faces), len(x_faces)-1).")
-
-    right_x = np.float32(params.get("right_x", x_faces[-1]))
-    max_points = int(params.get("max_points", 2000))
-    max_steps = int(params.get("max_steps", params.get("max_iters", max_points)))
-    if max_points < 1:
-        raise ValueError("max_points must be at least 1.")
-    if max_steps < 1:
-        raise ValueError("max_steps must be at least 1.")
+    x_faces, y_faces, vx, vy, seeds_x, seeds_y, right_x, max_points, max_steps = parse_pollock_inputs(params)
 
     _ensure_ti_init()
     PollockTracking2D = _make_pollock_tracker()
