@@ -99,6 +99,17 @@ def compute_travel_time_lrp(lrp, vx, vy, x, y, eps_speed=1e-12):
     return total_time
 
 
+def _build_faces_from_centers(centers):
+    centers = np.asarray(centers, dtype=np.float32).ravel()
+    if centers.size < 2:
+        raise ValueError("center coordinates must contain at least 2 values.")
+    faces = np.empty(centers.size + 1, dtype=np.float32)
+    faces[1:-1] = 0.5 * (centers[:-1] + centers[1:])
+    faces[0] = centers[0] - 0.5 * (centers[1] - centers[0])
+    faces[-1] = centers[-1] + 0.5 * (centers[-1] - centers[-2])
+    return faces
+
+
 def gpu_worker(config, event_stop_gpuworker, queue_gpu, result_dict):
     """
     GPU worker process: pulls tasks from the GPU task queue, processes them,
@@ -214,6 +225,18 @@ def run_unit_simulation(config, num_mc_, num_trial=50):
             continue
         # Velocity field
         vx, vy = hydraulic.compute_velocity(k_field, config_mc['x'], config_mc['y'], h)
+        tracking_method = config_mc['particleTracking_arg'].get('method', 'rk45')
+        if tracking_method == 'pollock':
+            vx_pollock, vy_pollock = hydraulic.compute_velocity(
+                k_field,
+                config_mc['x'],
+                config_mc['y'],
+                h,
+                output_location='face',
+                face_output='full',
+            )
+        else:
+            vx_pollock = vy_pollock = None
         # Compute travel time along LRP
         t_lrp = compute_travel_time_lrp(lrp, vx, vy, config_mc['x'], config_mc['y'], eps_speed=config_mc['particleTracking_arg']['eps_speed'])
 
@@ -229,6 +252,13 @@ def run_unit_simulation(config, num_mc_, num_trial=50):
             'vy': vy,
             'seeds_x': seeds_x,
             'seeds_y': seeds_y,
+            'backend': config_mc['particleTracking_arg'].get('backend', 'cpu'),
+            'method': tracking_method,
+            'tracking_mode': config_mc['particleTracking_arg'].get('tracking_mode', 'trajectory'),
+            'stop_mode': config_mc['particleTracking_arg'].get('stop_mode', 'first'),
+            'arrival_fraction': config_mc['particleTracking_arg'].get('arrival_fraction', 1.0),
+            'save_trajectories': config_mc['particleTracking_arg'].get('save_trajectories', True),
+            'return_fastest': config_mc['particleTracking_arg'].get('return_fastest', True),
             'right_x': x1,
             'eps_speed': config_mc['particleTracking_arg']['eps_speed'],
             'ds_min': config_mc['particleTracking_arg']['ds_min'],
@@ -240,7 +270,20 @@ def run_unit_simulation(config, num_mc_, num_trial=50):
             'threads_per_block': config_mc['particleTracking_arg']['threads_per_block'],
             'dtype': np.float64
         }
-        px, py, pt, L, st = particle_tracking.particle_tracking_cpu(args_particleTracking)
+        if tracking_method == 'pollock':
+            args_particleTracking.update(
+                {
+                    'x_faces': _build_faces_from_centers(config_mc['x']),
+                    'y_faces': _build_faces_from_centers(config_mc['y']),
+                    'vx': vx_pollock,
+                    'vy': vy_pollock,
+                    'max_steps': config_mc['particleTracking_arg']['max_iters'],
+                }
+            )
+
+        tracking_result = particle_tracking.particle_tracking_summary(args_particleTracking)
+        st = tracking_result['status']
+
         # 0=success, 1=stagnation, 4=other errors
         from collections import Counter
         count = Counter(st.tolist())
@@ -249,7 +292,9 @@ def run_unit_simulation(config, num_mc_, num_trial=50):
             continue
 
         # Fastest path
-        res = particle_tracking.fastest_trajectory(px, py, pt, L, st)
+        res = tracking_result.get('fastest')
+        if res is None:
+            raise ValueError("Current simulation flow requires a fastest trajectory; set return_fastest=True.")
         fp = np.vstack((res["x"], res["y"])).T
         fp = fp[fp[:,0] <= config_mc['x_cp']] # Trim the traj
         len_fp = utils.euclidean_length(fp)

@@ -20,14 +20,24 @@ from .rk45_cpu import (
     rhs_arclength,
     rk45_one_particle,
     particle_tracking_cpu,
+    particle_tracking_cpu_summary,
 )
 from .pollock import (
     pollock_step,
     trace_pathline,
     particle_tracking_pollock,
+    particle_tracking_pollock_summary,
 )
+from .pollock_gpu import particle_tracking_pollock_gpu_summary
 from .par2 import run_par2
-from .utils import fastest_trajectory, fastest_trajectory_with_snapshot
+from .utils import (
+    compute_travel_times,
+    extract_particle_trajectories,
+    fastest_trajectory,
+    fastest_trajectory_with_snapshot,
+    summarize_arrivals,
+)
+from .api import particle_tracking_rk45_gpu_summary, particle_tracking_summary
 
 try:
     # Numba's CUDA import can fail at import time if a driver isn't present/configured.
@@ -44,11 +54,19 @@ __all__ = [
     "rhs_arclength",
     "rk45_one_particle",
     "particle_tracking_cpu",
+    "particle_tracking_cpu_summary",
     "pollock_step",
     "trace_pathline",
     "particle_tracking_pollock",
+    "particle_tracking_pollock_summary",
+    "particle_tracking_pollock_gpu_summary",
+    "particle_tracking_rk45_gpu_summary",
+    "particle_tracking_summary",
+    "compute_travel_times",
+    "extract_particle_trajectories",
     "fastest_trajectory",
     "fastest_trajectory_with_snapshot",
+    "summarize_arrivals",
     "run_par2",
 ]
 

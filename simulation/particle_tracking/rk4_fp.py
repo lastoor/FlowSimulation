@@ -11,7 +11,10 @@ def _ensure_ti_init():
     """Initialize Taichi once per process (avoids ti.core which may not exist in all versions)."""
     global _ti_initialized
     if not _ti_initialized:
-        ti.init(arch=ti.gpu, verbose=False)
+        try:
+            ti.init(arch=ti.gpu, verbose=False)
+        except Exception:
+            ti.init(arch=ti.cpu, verbose=False)
         _ti_initialized = True
 
 
@@ -553,6 +556,121 @@ def rk4_fastest_path_params(params: dict) -> dict:
         raise RuntimeError("No particles reached the target in rk4_fastest_path_params.")
     path_x, path_y = sim.replay_winner(winner_idx)
     return {"particle_id": winner_idx, "travel_time": min_time, "x": path_x, "y": path_y}
+
+
+def rk4_particle_tracking_summary(params: dict) -> dict:
+    """Taichi-based particle tracking summary optimized for arrival metrics."""
+    from .utils import build_fastest_result_from_trajectory, fastest_particle_id, summarize_arrivals
+
+    tracking_mode = params.get("tracking_mode", "arrival")
+    if tracking_mode not in ("trajectory", "arrival"):
+        raise ValueError("tracking_mode must be 'trajectory' or 'arrival'.")
+
+    stop_mode = params.get("stop_mode", "first")
+    arrival_fraction = float(params.get("arrival_fraction", 1.0))
+    save_trajectories = bool(params.get("save_trajectories", tracking_mode == "trajectory"))
+    return_fastest = bool(params.get("return_fastest", stop_mode == "first"))
+    if tracking_mode == "trajectory" and stop_mode != "first":
+        raise NotImplementedError("GPU trajectory replay currently supports stop_mode='first' only.")
+    if save_trajectories and stop_mode not in ("first", "fraction"):
+        raise NotImplementedError("GPU trajectory replay currently supports stop_mode in {'first', 'fraction'} only.")
+
+    _ensure_ti_init()
+
+    x = np.asarray(params["x"], dtype=np.float64).ravel()
+    y = np.asarray(params["y"], dtype=np.float64).ravel()
+    vx = np.asarray(params["vx"], dtype=np.float64)
+    vy = np.asarray(params["vy"], dtype=np.float64)
+    seeds_x = np.asarray(params["seeds_x"], dtype=np.float32).ravel()
+    seeds_y = np.asarray(params["seeds_y"], dtype=np.float32).ravel()
+    right_x = float(params.get("right_x", x[-1]))
+
+    x_unif, y_unif, vx_unif, vy_unif, xmin, xmax, ymin, ymax = _resample_velocity_to_uniform(x, y, vx, vy)
+    vel_grid = np.stack([vx_unif, vy_unif], axis=2)
+
+    dt = float(params.get("dt", 0.01))
+    max_steps = int(params.get("max_steps", params.get("max_iters", 5000)))
+    exit_penalty = float(params.get("exit_penalty_time", 1e9))
+    y_policy = params.get("y_policy", "stop")
+    closed = params.get("closed_boundary", True)
+    velocity_location = params.get("velocity_location", "cell")
+
+    sim = ParticleTracking2D(
+        xmin=xmin,
+        xmax=xmax,
+        ymin=ymin,
+        ymax=ymax,
+        vel_grid=vel_grid,
+        seeds_x=seeds_x,
+        seeds_y=seeds_y,
+        right_x=right_x,
+        dt=dt,
+        max_steps=max_steps,
+        exit_penalty_time=exit_penalty,
+        y_policy=y_policy,
+        closed_boundary=closed,
+        diffusion_sigma=0.0,
+        velocity_location=velocity_location,
+        x_cell_centers=x_unif,
+        y_cell_centers=y_unif,
+    )
+    winner_idx, min_time, times_np = sim.run_pass1()
+    status = np.where(times_np < exit_penalty * 0.9, 0, 1).astype(np.int32)
+    summary = summarize_arrivals(times_np, status, stop_mode=stop_mode, arrival_fraction=arrival_fraction)
+    summary.update(
+        {
+            "backend": "gpu",
+            "method": "rk4",
+            "tracking_mode": tracking_mode,
+            "stop_mode": stop_mode,
+            "save_trajectories": save_trajectories,
+            "return_fastest": return_fastest,
+            "status": status,
+            "lengths": None,
+        }
+    )
+
+    selected_trajectories = []
+    if save_trajectories:
+        for pid in summary["selected_particle_ids"]:
+            path_x, path_y = sim.replay_winner(int(pid))
+            traj_time = float(times_np[int(pid)])
+            selected_trajectories.append(
+                {
+                    "particle_id": int(pid),
+                    "x": path_x,
+                    "y": path_y,
+                    "t": np.linspace(0.0, traj_time, path_x.size, dtype=np.float64),
+                }
+            )
+        summary["selected_trajectories"] = selected_trajectories
+
+    if return_fastest and summary["n_arrived"] > 0:
+        fastest_id = fastest_particle_id(times_np)
+        if save_trajectories and selected_trajectories:
+            fastest_traj = next((traj for traj in selected_trajectories if traj["particle_id"] == fastest_id), None)
+            if fastest_traj is None:
+                path_x, path_y = sim.replay_winner(fastest_id)
+                fastest_traj = {
+                    "particle_id": fastest_id,
+                    "x": path_x,
+                    "y": path_y,
+                    "t": np.linspace(0.0, float(times_np[fastest_id]), path_x.size, dtype=np.float64),
+                }
+            summary["fastest"] = build_fastest_result_from_trajectory(fastest_id, times_np[fastest_id], fastest_traj)
+        else:
+            path_x, path_y = sim.replay_winner(fastest_id)
+            fastest_traj = {
+                "particle_id": fastest_id,
+                "x": path_x,
+                "y": path_y,
+                "t": np.linspace(0.0, float(times_np[fastest_id]), path_x.size, dtype=np.float64),
+            }
+            summary["fastest"] = build_fastest_result_from_trajectory(fastest_id, times_np[fastest_id], fastest_traj)
+
+    summary["winner_idx"] = int(winner_idx)
+    summary["winner_time"] = float(min_time)
+    return summary
 
 
 def rk4_fastest_path(

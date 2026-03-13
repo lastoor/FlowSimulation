@@ -17,6 +17,11 @@ class GaussianRandomFieldCircEmbed:
         self.mean = mean
         self.cov  = cov
         self.pts  = pts
+        self._deterministic = bool(getattr(cov, "is_degenerate", False))
+
+        if self._deterministic:
+            self.data = None
+            return
 
         normedpts = [p - p[0] for p in pts]
 
@@ -59,6 +64,9 @@ class GaussianRandomFieldCircEmbed:
         """
         Single realization.  xi must be shape == self.data[1].
         """
+        if self._deterministic:
+            return np.array(self.mean, copy=True)
+
         Λ, shape_emb = self.data
         xi = np.random.randn(*shape_emb)
         # 1) spectral weights
@@ -166,10 +174,17 @@ class fBmGenerator:
         self.c          = c
         self.alpha      = alpha
         self.num_pt     = num_pt
+        self.dim        = dim
         self.pts        = (np.arange(num_pt) / num_pt,) * dim
         self.minpadding = minpadding if alpha <= 1.5 else minpadding+num_pt
         self.cov_c0 = None
         self.cov_c2 = None
+        self._deterministic = (c == 0)
+
+        if self._deterministic:
+            self._prefbm_gen = None
+            self._σ_trend = 0.0
+            return
 
         # 1) set up zero‑mean GRF with your Cov class
         mean = np.zeros(tuple(len(p) for p in self.pts))
@@ -180,6 +195,9 @@ class fBmGenerator:
         self._σ_trend = np.sqrt(2*self.cov_c2)
 
     def sample(self):
+        if self._deterministic:
+            return np.zeros((self.num_pt,) * self.dim)
+
         prefbm = self._prefbm_gen.sample()
 
         # build the linear trend ∑ x_i·X_i
@@ -200,6 +218,9 @@ def compute_c(l, H, std_target):
     Compute scale factor c needed so that a 2D fBm field of size l×l
     with Var[X] = 2*c*r^(2H) has marginal std = std_target.
     """
+    if std_target == 0:
+        return 0.0
+
     coords = np.arange(l) - (l - 1) / 2
     X, Y = np.meshgrid(coords, coords, indexing='ij')
     r = np.sqrt(X**2 + Y**2)
@@ -231,6 +252,7 @@ class ExpCov:
         self.sigma = sigma
         self.length_scale = length_scale
         self.is_even = True
+        self.is_degenerate = (sigma == 0)
     def __call__(self, x):
         r = np.linalg.norm(x)
         return self.sigma**2 * np.exp(-np.abs(r) / self.length_scale)

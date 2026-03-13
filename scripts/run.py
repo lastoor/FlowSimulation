@@ -258,6 +258,13 @@ def run_unit_simulation(config, num_mc_, num_trial=50, seed=None):
             "vy": vy,
             "seeds_x": seeds_x,
             "seeds_y": seeds_y,
+            "backend": "cpu",
+            "method": config_mc["particleTracking_arg"].get("method", "rk45"),
+            "tracking_mode": config_mc["particleTracking_arg"].get("tracking_mode", "trajectory"),
+            "stop_mode": config_mc["particleTracking_arg"].get("stop_mode", "first"),
+            "arrival_fraction": config_mc["particleTracking_arg"].get("arrival_fraction", 1.0),
+            "save_trajectories": config_mc["particleTracking_arg"].get("save_trajectories", True),
+            "return_fastest": config_mc["particleTracking_arg"].get("return_fastest", True),
             "right_x": x1,
             "eps_speed": config_mc["particleTracking_arg"]["eps_speed"],
             "ds_min": config_mc["particleTracking_arg"]["ds_min"],
@@ -302,12 +309,15 @@ def run_unit_simulation(config, num_mc_, num_trial=50, seed=None):
 
         if fp is None:
             try:
-                px, py, pt, L, st = particle_tracking.particle_tracking_cpu(args_tracking)
+                summary = particle_tracking.particle_tracking_summary(args_tracking)
+                st = summary["status"]
                 count = Counter(st.tolist())
                 if count[0] / nP < 0.5 or (count[1] + count[4]) / nP > 0.1:
                     logger.warning(f"[MC {num_mc_}] Invalid velocity field for CPU RK45 fallback: {count}")
                     continue
-                r = particle_tracking.fastest_trajectory(px, py, pt, L, st)
+                r = summary.get("fastest")
+                if r is None:
+                    raise ValueError("Current workflow requires return_fastest=True.")
                 fp = np.vstack((r["x"], r["y"])).T
                 travel_time = float(r["travel_time"])
                 res = {"travel_time": travel_time}

@@ -1,5 +1,48 @@
 # Agent Log
 
+## 2026-03-13 00:25:00 UTC
+- Made `particle_tracking_summary(params)` the canonical high-level particle-tracking return path for the live runtime flow.
+- Added `return_fastest` to the summary API so particle tracking can directly include or omit the fastest-path payload without a separate reduction step.
+- Centralized fastest-result construction in shared particle-tracking utilities and switched the summary backends to use it consistently.
+- Removed the remaining legacy `particle_tracking_* -> fastest_trajectory(...)` reduction path from `simulation/main.py` and `scripts/run.py`.
+- Kept tuple-returning trackers and `fastest_trajectory(...)` as compatibility helpers rather than removing them outright.
+- Added tests covering `return_fastest=False` and reverified the particle-tracking test module with `python tests/test_particle_tracking.py`.
+- Updated `README.md` to document the canonical summary API and compatibility status of the older reduction helper flow.
+
+## 2026-03-13 00:05:00 UTC
+- Added a Taichi-based GPU Pollock summary backend under `method="pollock", backend="gpu"`.
+- Kept GPU Pollock summary-first: it computes arrival metrics on GPU and replays only selected trajectories with the existing Pollock stepping logic.
+- Updated the method-aware dispatcher and package exports so Pollock now supports both CPU and GPU in the high-level summary API.
+- Added particle-tracking tests covering GPU Pollock arrival summaries and selected-trajectory replay.
+- Verified the updated particle-tracking test module with `python tests/test_particle_tracking.py`.
+- Updated `README.md` with the new Pollock GPU support and the revised support-matrix/possible-issues notes.
+
+## 2026-03-12 23:05:00 UTC
+- Added `method="pollock" | "rk45" | "rk4"` to the high-level `particle_tracking_summary(params)` API.
+- Added CPU Pollock summary support and GPU RK45 summary support alongside the existing CPU RK45 and GPU RK4/Taichi summary paths.
+- Made the dispatcher validate the current support matrix explicitly: Pollock on CPU, RK45 on CPU/GPU, RK4 on GPU.
+- Added `method` to particle-tracking config defaults and wired Pollock-compatible face inputs into `simulation/main.py`.
+- Added particle-tracking tests for Pollock CPU summaries, RK45 GPU summaries, backend-default method selection, and invalid method/backend combinations.
+- Verified the updated particle-tracking test module with `python tests/test_particle_tracking.py`.
+- Updated `README.md` with the new `method` selector and the current method/backend support table.
+
+## 2026-03-12 22:10:00 UTC
+- Added `simulation.particle_tracking.particle_tracking_summary(params)` as a high-level particle-tracking API with `backend`, `tracking_mode`, `stop_mode`, `arrival_fraction`, and `save_trajectories` controls.
+- Added shared arrival-analysis helpers for per-particle travel times, arrival ordering, threshold stopping, and selected trajectory extraction.
+- Added CPU RK45 summary support while preserving the existing tuple-returning `particle_tracking_cpu(...)` and `fastest_trajectory(...)` APIs.
+- Added Taichi-based GPU summary support for arrival metrics, with optional replay of selected trajectories and current replay limits documented for non-`first` stopping modes.
+- Added particle-tracking tests covering arrival summaries, CPU fraction stopping, and a Taichi-backed GPU arrival-mode smoke path.
+- Verified the updated particle-tracking test module with `python tests/test_particle_tracking.py`.
+- Updated `README.md` with the new particle-tracking summary API and backend/stopping-mode notes.
+
+## 2026-03-12 20:15:00 UTC
+- Added deterministic zero-variance handling in `simulation/grf_generation.py` for degenerate random fields.
+- Updated `compute_c(..., std_target=0)` to return `0.0` and made `fBmGenerator(c=0, ...)` return a uniform zero `logk_field`.
+- Updated `ExpCov(sigma=0, ...)` and `GaussianRandomFieldCircEmbed(...)` so zero covariance scale returns the configured mean field instead of sampling through the FFT path.
+- Added GRF tests covering zero `std`, zero `c`, zero `sigma`, and zero-scale `generate_logk_field(...)`.
+- Verified the GRF test module with `python tests/test_grf_generation.py`.
+- Updated `README.md` to document the zero-variance uniform-field behavior.
+
 ## 2026-03-12 03:20:00 UTC
 - Added Pollock support to `tests/Compare_PAR2_Py/compare.py` as a first-class comparison backend alongside PAR2, RK45 CPU/GPU, RK4 FP, and MODPATH7.
 - Added the `--no-pollock` CLI flag and included Pollock in console summaries, saved `.npz` outputs, figure overlays, and synthetic-case evaluation.

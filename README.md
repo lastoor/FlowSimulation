@@ -30,6 +30,11 @@ Typical runtime dependencies include:
 ## Run the new hybrid script
 Use exactly one of `--std` or `--c`.
 
+Zero-variance behavior:
+- `--std 0` is valid and produces a uniform zero `logk_field`.
+- `--c 0` is also valid and produces the same uniform zero `logk_field`.
+- Downstream, `k_field = exp(logk_field)` is therefore uniform at `1.0` for this default zero-mean fBm path.
+
 ### Single size example
 ```bash
 python scripts/run.py \
@@ -81,6 +86,27 @@ Per-MC file:
 ## Notes
 - If GPU RK4 tracking fails on a realization, the workflow falls back to CPU RK45 tracking.
 - PETSc solve failures or invalid trajectories trigger retry logic up to `--num_trial`.
+- For generic Gaussian random fields built directly from `GaussianRandomFieldCircEmbed`, using `ExpCov(sigma=0)` returns the configured mean field exactly.
+
+## Particle-Tracking Summary API
+- `simulation.particle_tracking.particle_tracking_summary(params)` is the high-level entrypoint for travel-time-oriented particle tracking.
+- New common options:
+  - `backend`: `"cpu"` or `"gpu"`
+  - `method`: `"pollock"`, `"rk45"`, or `"rk4"`
+  - `tracking_mode`: `"trajectory"` or `"arrival"`
+  - `stop_mode`: `"first"`, `"fraction"`, or `"full_btc"`
+  - `arrival_fraction`: fraction of released particles for `stop_mode="fraction"`
+  - `save_trajectories`: whether to attach the selected trajectories to the summary output
+  - `return_fastest`: whether to include the fastest-path payload directly in the returned summary
+- `particle_tracking_summary(params)` is now the canonical high-level API for both fastest-path and arrival/BTC workflows.
+- The existing low-level APIs such as `particle_tracking_cpu(...)` and `fastest_trajectory(...)` remain unchanged for compatibility, but new code should prefer the summary API.
+- Current method/backend support:
+  - `method="pollock"` with `backend="cpu"` or `backend="gpu"`
+  - `method="rk45"` with `backend="cpu"` or `backend="gpu"`
+  - `method="rk4"` with `backend="gpu"`
+- If `method` is omitted, the summary API defaults to `rk45` on CPU and `rk4` on GPU.
+- The GPU summary paths for `rk4` and `pollock` use Taichi and are optimized for arrival metrics; trajectory replay is currently limited to selected particles and not the full breakthrough-curve population.
+- The main simulation/runtime flow now consumes the summary result directly instead of tracking everything and then calling a separate fastest-path reduction helper.
 
 ## Velocity Field Location Convention
 - `velocity_location="cell"`: `vx`/`vy` are treated as cell-centered and interpolated bilinearly.
@@ -96,6 +122,7 @@ Per-MC file:
 
 ## Pollock Backend
 - `simulation.particle_tracking.particle_tracking_pollock(params)` is available as a first-class particle-tracking backend.
+- `simulation.particle_tracking.particle_tracking_summary(params)` also supports `method="pollock", backend="gpu"` for Taichi-based arrival/summary execution with optional replay of selected trajectories.
 - Pollock requires explicit face coordinates and full staggered face velocities:
   - `x_faces`: shape `(nx + 1,)`
   - `y_faces`: shape `(ny + 1,)`
@@ -183,3 +210,11 @@ python tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py \
 
 1. `solve_head` still defaults to `spacing_mode="uniform"` for backward compatibility; callers must opt in to `spacing_mode="center_faces"` to use coordinate-derived spacing.
 2. Boundary gradients in `compute_velocity` are still one-sided; higher-order boundary discretization remains a separate improvement.
+3. Particle-tracking solvers do not yet share one unified velocity-input abstraction: RK45 CPU/GPU support both cell-centered and face-centered velocity interpretation, RK4/Taichi also supports both modes through its own packed velocity-field representation, while Pollock is face-only and requires explicit full staggered face arrays.
+4. GPU particle tracking is currently split across two stacks: RK45 GPU uses `numba.cuda`, while RK4 GPU uses `taichi`. This means different runtime dependencies, initialization behavior, debugging workflows, and likely different performance/portability characteristics.
+5. The method/backend support matrix is still asymmetric: `pollock` now supports CPU and GPU, `rk45` supports CPU and GPU, but `rk4` is still exposed as GPU-only. A longer-term cleanup would make CPU/GPU availability consistent across all three methods.
+6. Pollock’s public API is still more specialized than RK45/RK4: it consumes `x_faces`, `y_faces`, and full staggered face velocities directly, while RK45/RK4 use the more generic `x/y + vx/vy (+ velocity_location)` interface. A shared adapter layer would reduce this split.
+7. `tracking_mode="arrival"` improves the returned interface, but not all underlying implementations are fully optimized for arrival-only workloads yet. In particular, the current RK45 GPU summary path still wraps the existing full-trajectory CUDA kernel, so memory use is not yet minimized there.
+8. GPU RK4/Taichi and GPU Pollock/Taichi trajectory replay are still limited compared with the CPU tuple-based paths: they are currently intended for selected trajectories rather than full-trajectory retention for the entire particle population.
+9. The end-to-end Monte Carlo flow in `simulation/main.py` still assumes a fastest-trajectory workflow for FP geometry checks. The new arrival/fraction/full-BTC summary modes exist, but the main simulation loop is not yet fully redesigned around breakthrough-curve analysis.
+10. The legacy tuple-returning particle-tracking APIs and `fastest_trajectory(...)` helper still exist for compatibility, so there is still some duplication in the public surface even though the live runtime flow now uses the direct-return summary path.

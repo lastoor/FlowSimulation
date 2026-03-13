@@ -55,6 +55,13 @@ def create_base_config(args):
 
     config_base['particleTracking_arg'] = {
         'density_particle': 20,
+        'backend': 'cpu',
+        'method': 'rk45',
+        'tracking_mode': 'trajectory',
+        'stop_mode': 'first',
+        'arrival_fraction': 1.0,
+        'save_trajectories': True,
+        'return_fastest': True,
         'eps_speed': 1e-30,
         'ds_min': 1e-20,
         'ds_max': 0.5*min(config_base['dx'], config_base['dy']),

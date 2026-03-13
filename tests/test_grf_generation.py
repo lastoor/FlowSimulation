@@ -32,6 +32,11 @@ class TestFbmGenerator(unittest.TestCase):
         expected = std_target**2 / (2 * avg_r2H)
         self.assertAlmostEqual(c, expected)
 
+    def test_compute_c_zero_std(self):
+        """Zero target std should produce zero scale."""
+        c = grf_generation.compute_c(8, 0.5, 0.0)
+        self.assertEqual(c, 0.0)
+
         # Larger grid, different H
         l = 10
         H = 0.25
@@ -146,6 +151,13 @@ class TestFbmGenerator(unittest.TestCase):
         # Variance should be positive
         self.assertGreater(np.var(field), 0)
 
+    def test_fBmGenerator_sample_zero_scale(self):
+        """Zero-scale fBm should return a uniform zero field."""
+        fbm = grf_generation.fBmGenerator(c=0.0, alpha=0.7, num_pt=16, dim=2, minpadding=0)
+        field = fbm.sample()
+        self.assertEqual(field.shape, (16, 16))
+        self.assertTrue(np.all(field == 0.0))
+
     def test_generate_logk_field(self):
         """Test logk field generation wrapper."""
         np.random.seed(99)
@@ -162,6 +174,25 @@ class TestFbmGenerator(unittest.TestCase):
         logk_field, msg = grf_generation.generate_logk_field(broken)
         self.assertIsNone(logk_field)
         self.assertIn('unsuccessfully', msg)
+
+    def test_generate_logk_field_zero_scale(self):
+        """Zero-scale generator should still succeed."""
+        fbm = grf_generation.fBmGenerator(c=0.0, alpha=0.5, num_pt=8, dim=2, minpadding=0)
+        logk_field, msg = grf_generation.generate_logk_field(fbm)
+        self.assertIsNotNone(logk_field)
+        self.assertEqual(logk_field.shape, (8, 8))
+        self.assertTrue(np.all(logk_field == 0.0))
+        self.assertIn('successfully', msg)
+
+    def test_GaussianRandomFieldCircEmbed_sample_zero_sigma(self):
+        """Zero-sigma exponential covariance should return the mean field."""
+        mean = np.full((4, 4), 3.5)
+        cov = grf_generation.ExpCov(sigma=0.0, length_scale=2.0)
+        pts = [np.arange(4), np.arange(4)]
+        grf = grf_generation.GaussianRandomFieldCircEmbed(mean, cov, pts, minpadding=0)
+        sample = grf.sample()
+        self.assertEqual(sample.shape, (4, 4))
+        self.assertTrue(np.all(sample == mean))
 
 
 if __name__ == '__main__':

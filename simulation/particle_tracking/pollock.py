@@ -1,6 +1,8 @@
 import numpy as np
 from numba import njit
 
+from .utils import build_fastest_result_from_arrays, compute_travel_times, extract_particle_trajectories, summarize_arrivals
+
 
 STATUS_SUCCESS = np.int32(0)
 STATUS_STAGNATION = np.int32(1)
@@ -328,3 +330,44 @@ def particle_tracking_pollock(params):
         status[i] = st
 
     return paths_x, paths_y, paths_t, lengths, status
+
+
+def particle_tracking_pollock_summary(params):
+    """High-level CPU Pollock tracking API with optional arrival-only summaries."""
+    tracking_mode = params.get("tracking_mode", "trajectory")
+    if tracking_mode not in ("trajectory", "arrival"):
+        raise ValueError("tracking_mode must be 'trajectory' or 'arrival'.")
+
+    stop_mode = params.get("stop_mode", "first")
+    arrival_fraction = float(params.get("arrival_fraction", 1.0))
+    save_trajectories = bool(params.get("save_trajectories", tracking_mode == "trajectory"))
+    return_fastest = bool(params.get("return_fastest", stop_mode == "first"))
+
+    px, py, pt, L, st = particle_tracking_pollock(params)
+    travel_times = compute_travel_times(pt, L, st)
+    summary = summarize_arrivals(travel_times, st, stop_mode=stop_mode, arrival_fraction=arrival_fraction)
+    summary.update(
+        {
+            "backend": "cpu",
+            "method": "pollock",
+            "tracking_mode": tracking_mode,
+            "stop_mode": stop_mode,
+            "save_trajectories": save_trajectories,
+            "return_fastest": return_fastest,
+            "status": st,
+            "lengths": L,
+        }
+    )
+
+    if tracking_mode == "trajectory" or save_trajectories:
+        summary["px"] = px
+        summary["py"] = py
+        summary["pt"] = pt
+
+    if save_trajectories:
+        summary["selected_trajectories"] = extract_particle_trajectories(px, py, pt, L, summary["selected_particle_ids"])
+
+    if return_fastest:
+        summary["fastest"] = build_fastest_result_from_arrays(px, py, pt, L, travel_times)
+
+    return summary

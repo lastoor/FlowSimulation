@@ -126,6 +126,25 @@ class TestParticleTracking(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             particle_tracking.fastest_trajectory(px, py, pt, L, st)
 
+    def test_summarize_arrivals_fraction(self):
+        """Arrival summaries should preserve arrival order and threshold selection."""
+        travel_times = np.array([5.0, np.nan, 2.0, 7.0], dtype=np.float64)
+        status = np.array([0, 1, 0, 0], dtype=np.int32)
+
+        summary = particle_tracking.summarize_arrivals(
+            travel_times,
+            status,
+            stop_mode="fraction",
+            arrival_fraction=0.5,
+        )
+
+        np.testing.assert_array_equal(summary["arrival_order_ids"], np.array([2, 0, 3], dtype=np.int32))
+        np.testing.assert_allclose(summary["arrival_order_times"], np.array([2.0, 5.0, 7.0]))
+        np.testing.assert_array_equal(summary["selected_particle_ids"], np.array([2, 0], dtype=np.int32))
+        self.assertEqual(summary["stopping_particle_id"], 0)
+        self.assertAlmostEqual(summary["stopping_travel_time"], 5.0)
+        self.assertTrue(summary["threshold_reached"])
+
     def test_particle_tracking_cpu_uniform_velocity(self):
         """Test particle tracking with uniform velocity field (should be straight line)."""
         # Create a simple uniform velocity field (vx = 1, vy = 0)
@@ -207,6 +226,301 @@ class TestParticleTracking(unittest.TestCase):
         self.assertEqual(st[0], 1)
         # Only initial point recorded
         self.assertEqual(L[0], 1)
+
+    def test_particle_tracking_cpu_summary_fraction(self):
+        """CPU summary API should support fraction stopping without requiring fastest-path extraction."""
+        nx, ny = 10, 10
+        x = np.linspace(0, 9, nx, dtype=np.float32)
+        y = np.linspace(0, 9, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+
+        params = {
+            "x": x,
+            "y": y,
+            "vx": vx,
+            "vy": vy,
+            "seeds_x": np.zeros(4, dtype=np.float32),
+            "seeds_y": np.linspace(y[0], y[-1], 4, dtype=np.float32),
+            "right_x": x[-1],
+            "tracking_mode": "arrival",
+            "stop_mode": "fraction",
+            "arrival_fraction": 0.5,
+            "save_trajectories": False,
+            "eps_speed": 1e-16,
+            "ds_min": 1e-5,
+            "ds_max": 0.5,
+            "tol": 1e-4,
+            "y_policy": "stop",
+            "max_points": 2000,
+            "max_iters": 200000,
+        }
+
+        summary = particle_tracking.particle_tracking_summary(params)
+
+        self.assertEqual(summary["backend"], "cpu")
+        self.assertEqual(summary["method"], "rk45")
+        self.assertEqual(summary["tracking_mode"], "arrival")
+        self.assertEqual(summary["n_arrived"], 4)
+        self.assertEqual(summary["target_arrivals"], 2)
+        self.assertEqual(summary["selected_particle_ids"].size, 2)
+        self.assertNotIn("px", summary)
+        self.assertNotIn("selected_trajectories", summary)
+        self.assertNotIn("fastest", summary)
+
+    def test_particle_tracking_summary_return_fastest_false(self):
+        """Summary API should omit fastest when return_fastest is disabled."""
+        nx, ny = 8, 8
+        x = np.linspace(0, 7, nx, dtype=np.float32)
+        y = np.linspace(0, 7, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+
+        summary = particle_tracking.particle_tracking_summary(
+            {
+                "backend": "cpu",
+                "method": "rk45",
+                "tracking_mode": "trajectory",
+                "stop_mode": "first",
+                "save_trajectories": True,
+                "return_fastest": False,
+                "x": x,
+                "y": y,
+                "vx": vx,
+                "vy": vy,
+                "seeds_x": np.zeros(2, dtype=np.float32),
+                "seeds_y": np.linspace(y[0], y[-1], 2, dtype=np.float32),
+                "right_x": x[-1],
+            }
+        )
+
+        self.assertNotIn("fastest", summary)
+        self.assertIn("selected_trajectories", summary)
+
+    def test_particle_tracking_summary_pollock_cpu(self):
+        """Method selector should support Pollock on CPU."""
+        x_faces = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 4), dtype=np.float32)
+        vy = np.zeros((3, 3), dtype=np.float32)
+
+        summary = particle_tracking.particle_tracking_summary(
+            {
+                "backend": "cpu",
+                "method": "pollock",
+                "tracking_mode": "arrival",
+                "stop_mode": "first",
+                "save_trajectories": False,
+                "x_faces": x_faces,
+                "y_faces": y_faces,
+                "vx": vx,
+                "vy": vy,
+                "seeds_x": np.array([0.0, 0.5], dtype=np.float32),
+                "seeds_y": np.array([0.25, 1.25], dtype=np.float32),
+                "right_x": x_faces[-1],
+                "max_points": 16,
+                "max_steps": 16,
+            }
+        )
+
+        self.assertEqual(summary["backend"], "cpu")
+        self.assertEqual(summary["method"], "pollock")
+        self.assertEqual(summary["stopping_particle_id"], 1)
+        self.assertAlmostEqual(summary["stopping_travel_time"], 2.5, delta=2e-5)
+        self.assertIn("fastest", summary)
+
+    def test_particle_tracking_summary_pollock_gpu_arrival_smoke(self):
+        """Method selector should support Pollock on GPU for arrival summaries."""
+        x_faces = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 4), dtype=np.float32)
+        vy = np.zeros((3, 3), dtype=np.float32)
+
+        try:
+            summary = particle_tracking.particle_tracking_summary(
+                {
+                    "backend": "gpu",
+                    "method": "pollock",
+                    "tracking_mode": "arrival",
+                    "stop_mode": "fraction",
+                    "arrival_fraction": 0.5,
+                    "save_trajectories": False,
+                    "x_faces": x_faces,
+                    "y_faces": y_faces,
+                    "vx": vx,
+                    "vy": vy,
+                    "seeds_x": np.array([0.0, 0.5], dtype=np.float32),
+                    "seeds_y": np.array([0.25, 1.25], dtype=np.float32),
+                    "right_x": x_faces[-1],
+                    "max_points": 16,
+                    "max_steps": 16,
+                }
+            )
+        except Exception as exc:
+            self.skipTest(f"Taichi GPU Pollock summary unavailable in this environment: {exc}")
+
+        self.assertEqual(summary["backend"], "gpu")
+        self.assertEqual(summary["method"], "pollock")
+        self.assertEqual(summary["target_arrivals"], 1)
+        self.assertEqual(summary["stopping_particle_id"], 1)
+        self.assertAlmostEqual(summary["stopping_travel_time"], 2.5, delta=2e-5)
+
+    def test_particle_tracking_summary_pollock_gpu_selected_trajectory(self):
+        """GPU Pollock should replay selected trajectories when requested."""
+        x_faces = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 4), dtype=np.float32)
+        vy = np.zeros((3, 3), dtype=np.float32)
+
+        try:
+            summary = particle_tracking.particle_tracking_summary(
+                {
+                    "backend": "gpu",
+                    "method": "pollock",
+                    "tracking_mode": "trajectory",
+                    "stop_mode": "first",
+                    "save_trajectories": True,
+                    "x_faces": x_faces,
+                    "y_faces": y_faces,
+                    "vx": vx,
+                    "vy": vy,
+                    "seeds_x": np.array([0.0, 0.5], dtype=np.float32),
+                    "seeds_y": np.array([0.25, 1.25], dtype=np.float32),
+                    "right_x": x_faces[-1],
+                    "max_points": 16,
+                    "max_steps": 16,
+                }
+            )
+        except Exception as exc:
+            self.skipTest(f"Taichi GPU Pollock trajectory summary unavailable in this environment: {exc}")
+
+        self.assertEqual(summary["method"], "pollock")
+        self.assertIn("fastest", summary)
+        self.assertIn("selected_trajectories", summary)
+        self.assertEqual(len(summary["selected_trajectories"]), 1)
+        self.assertAlmostEqual(summary["fastest"]["x"][-1], x_faces[-1], places=6)
+
+    def test_particle_tracking_summary_default_method_matches_backend(self):
+        """Omitting method should preserve backend-specific defaults."""
+        nx, ny = 8, 8
+        x = np.linspace(0, 7, nx, dtype=np.float32)
+        y = np.linspace(0, 7, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+
+        summary_cpu = particle_tracking.particle_tracking_summary(
+            {
+                "backend": "cpu",
+                "tracking_mode": "arrival",
+                "stop_mode": "first",
+                "save_trajectories": False,
+                "x": x,
+                "y": y,
+                "vx": vx,
+                "vy": vy,
+                "seeds_x": np.zeros(2, dtype=np.float32),
+                "seeds_y": np.linspace(y[0], y[-1], 2, dtype=np.float32),
+                "right_x": x[-1],
+            }
+        )
+        self.assertEqual(summary_cpu["method"], "rk45")
+
+        try:
+            summary_gpu = particle_tracking.particle_tracking_summary(
+                {
+                    "backend": "gpu",
+                    "tracking_mode": "arrival",
+                    "stop_mode": "first",
+                    "save_trajectories": False,
+                    "x": x,
+                    "y": y,
+                    "vx": vx,
+                    "vy": vy,
+                    "seeds_x": np.zeros(2, dtype=np.float32),
+                    "seeds_y": np.linspace(y[0], y[-1], 2, dtype=np.float32),
+                    "right_x": x[-1],
+                    "dt": 0.1,
+                    "max_steps": 200,
+                }
+            )
+        except Exception as exc:
+            self.skipTest(f"Taichi GPU summary unavailable in this environment: {exc}")
+        self.assertEqual(summary_gpu["method"], "rk4")
+
+    def test_particle_tracking_summary_gpu_arrival_smoke(self):
+        """GPU/Taichi summary should return arrival metrics for a simple uniform field."""
+        nx, ny = 8, 8
+        x = np.linspace(0, 7, nx, dtype=np.float32)
+        y = np.linspace(0, 7, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+
+        params = {
+            "x": x,
+            "y": y,
+            "vx": vx,
+            "vy": vy,
+            "seeds_x": np.zeros(3, dtype=np.float32),
+            "seeds_y": np.linspace(y[0], y[-1], 3, dtype=np.float32),
+            "right_x": x[-1],
+            "backend": "gpu",
+            "tracking_mode": "arrival",
+            "stop_mode": "first",
+            "save_trajectories": False,
+            "dt": 0.1,
+            "max_steps": 200,
+        }
+
+        try:
+            summary = particle_tracking.particle_tracking_summary(params)
+        except Exception as exc:
+            self.skipTest(f"Taichi GPU summary unavailable in this environment: {exc}")
+
+        self.assertEqual(summary["backend"], "gpu")
+        self.assertEqual(summary["method"], "rk4")
+        self.assertEqual(summary["tracking_mode"], "arrival")
+        self.assertEqual(summary["n_arrived"], 3)
+        self.assertEqual(summary["stopping_particle_id"], 0)
+        self.assertGreater(summary["stopping_travel_time"], 0.0)
+
+    def test_particle_tracking_summary_rk45_gpu_smoke(self):
+        """Method selector should support RK45 on GPU when available."""
+        nx, ny = 8, 8
+        x = np.linspace(0, 7, nx, dtype=np.float32)
+        y = np.linspace(0, 7, ny, dtype=np.float32)
+        vx = np.ones((ny, nx), dtype=np.float32)
+        vy = np.zeros((ny, nx), dtype=np.float32)
+
+        try:
+            summary = particle_tracking.particle_tracking_summary(
+                {
+                    "backend": "gpu",
+                    "method": "rk45",
+                    "tracking_mode": "arrival",
+                    "stop_mode": "first",
+                    "save_trajectories": False,
+                    "x": x,
+                    "y": y,
+                    "vx": vx,
+                    "vy": vy,
+                    "seeds_x": np.zeros(2, dtype=np.float32),
+                    "seeds_y": np.linspace(y[0], y[-1], 2, dtype=np.float32),
+                    "right_x": x[-1],
+                    "max_points": 512,
+                    "max_iters": 4096,
+                }
+            )
+        except Exception as exc:
+            self.skipTest(f"RK45 GPU summary unavailable in this environment: {exc}")
+
+        self.assertEqual(summary["backend"], "gpu")
+        self.assertEqual(summary["method"], "rk45")
+        self.assertGreaterEqual(summary["n_arrived"], 1)
+
+    def test_particle_tracking_summary_invalid_method_backend(self):
+        """Unsupported method/backend combinations should fail clearly."""
+        with self.assertRaises(ValueError):
+            particle_tracking.particle_tracking_summary({"backend": "cpu", "method": "rk4"})
 
     def test_particle_tracking_cpu_face_velocity_uniform_flow(self):
         """Face-centered mode should advect particles rightward under uniform vx."""
