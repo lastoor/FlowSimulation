@@ -16,6 +16,9 @@ POLLOCK_NUDGE_F32 = 32.0 * np.finfo(np.float32).eps
 
 def parse_pollock_inputs(params):
     """Validate and normalize common Pollock inputs."""
+    # Future refinement: support virtual subcell Pollock here by refining
+    # x/y faces and resampling vx/vy onto a denser staggered grid before
+    # dispatching to the existing CPU/GPU Pollock trackers.
     x_faces = np.asarray(params["x_faces"], dtype=np.float32)
     y_faces = np.asarray(params["y_faces"], dtype=np.float32)
     vx = np.asarray(params["vx"], dtype=np.float32)

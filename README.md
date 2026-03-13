@@ -136,6 +136,8 @@ Per-MC file:
 - GPU Pollock now tracks each particle to completion inside a single Taichi kernel launch instead of looping step-by-step from Python.
 - Pollock capture at `right_x` is now handled analytically inside the per-cell step, so particles stop exactly on an in-cell target boundary instead of being linearly clipped afterward.
 - If Taichi GPU initialization fails, Pollock GPU now emits a warning before falling back to the Taichi CPU backend.
+- The Taichi Pollock helper functions have also been refactored to avoid unsupported early returns inside `@ti.func`, which is required for Taichi 1.6 compatibility.
+- GPU Pollock summary results now mask non-success particle times before arrival ordering / fastest-particle selection, so failed particles cannot be incorrectly reported as zero-time “fastest” arrivals.
 
 Example:
 ```python
@@ -161,16 +163,19 @@ best = particle_tracking.fastest_trajectory(px, py, pt, L, st)
 ```
 
 ## PAR2 Comparison Workflow
-- `tests/Compare_PAR2_Py/compare.py` now includes Pollock in the solver comparison workflow alongside PAR2, RK45 CPU/GPU, RK4 FP, and optional MODPATH7.
+- `tests/Compare_PAR2_Py/compare.py` now includes Pollock CPU and Pollock GPU as separate solver entries alongside PAR2, RK45 CPU/GPU, RK4 FP, and optional MODPATH7.
 - New CLI control:
-  - `--no-pollock`: skip Pollock while leaving the other solvers enabled.
+  - `--no-pollock`: skip both Pollock backends while leaving the other solvers enabled.
+  - `--no-pollock-cpu`: skip only Pollock CPU.
+  - `--no-pollock-gpu`: skip only Pollock GPU.
 - The comparison script still uses trimmed `QXX`/`QYY`-style arrays for PAR2/RK45/RK4 plotting and file outputs, but it now reconstructs Pollock inputs internally:
   - `x_faces`, `y_faces`
   - `vx_full (ny, nx + 1)`
   - `vy_full (ny + 1, nx)`
+- Pollock CPU and Pollock GPU now run through `particle_tracking_summary(...)` and save/plot their fastest-path results independently.
 - Pollock results are now included in:
-  - console travel-time summaries
-  - saved `.npz` outputs as `pollock_x`, `pollock_y`, `pollock_time`
+  - console travel-time summaries as `Pollock CPU` and `Pollock GPU`
+  - saved `.npz` outputs as `pollock_cpu_x`, `pollock_cpu_y`, `pollock_cpu_time`, `pollock_gpu_x`, `pollock_gpu_y`, `pollock_gpu_time`
   - saved reconstructed inputs as `pollock_x_faces`, `pollock_y_faces`, `pollock_vx_full`, `pollock_vy_full`
   - figure overlays and synthetic-case evaluation metrics
 - Example:
@@ -224,3 +229,4 @@ python tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py \
 9. The end-to-end Monte Carlo flow in `simulation/main.py` still assumes a fastest-trajectory workflow for FP geometry checks. The new arrival/fraction/full-BTC summary modes exist, but the main simulation loop is not yet fully redesigned around breakthrough-curve analysis.
 10. The legacy tuple-returning particle-tracking APIs and `fastest_trajectory(...)` helper still exist for compatibility, so there is still some duplication in the public surface even though the live runtime flow now uses the direct-return summary path.
 11. Pollock still treats “captured at `right_x`” and “exited the domain through another boundary” under the same success status code. Arrival summaries still use travel-time/selection logic correctly, but a future cleanup could separate those outcomes more explicitly.
+12. Pollock accuracy can degrade on highly oscillatory velocity fields because it assumes approximately linear velocity variation within each cell. A planned future improvement is “virtual subcell Pollock”: subdivide each coarse cell into smaller physical subcells, resample the staggered face velocities onto the refined grid, and then run the existing Pollock solver on that refined field. For strongly sub-cell-varying fields, RK45/RK4 should still be treated as the more reliable reference family.

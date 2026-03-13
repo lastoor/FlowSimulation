@@ -1,5 +1,33 @@
 # Agent Log
 
+## 2026-03-13 02:30:00 UTC
+- Recorded virtual-subcell Pollock as a future refinement for highly oscillatory velocity fields.
+- Noted that the high-frequency synthetic compare case is now a shared Pollock CPU/GPU modeling limitation rather than a backend mismatch: both backends agree, but the coarse-cell linear-in-cell Pollock assumption lags the expected lane/travel time.
+- Documented the intended future approach in `README.md`: subdivide coarse cells, resample `vx_full` / `vy_full` onto a refined staggered grid, and run the existing Pollock solver there, while continuing to treat RK methods as the preferred reference family for strongly sub-cell-varying fields.
+
+## 2026-03-13 02:18:00 UTC
+- Fixed GPU Pollock summary result shaping so non-success tracker times are masked to `NaN` before arrival ordering and fastest-particle selection.
+- This prevents failed particles with raw zero/low final times from being incorrectly reported as the fastest Pollock GPU arrival in higher-level workflows such as `tests/Compare_PAR2_Py/compare.py`.
+- Reverified the particle-tracking test module with `python tests/test_particle_tracking.py`.
+- In this environment the compare-script synthetic smoke path still cannot exercise Pollock GPU because `taichi` is not installed, but it now cleanly skips rather than reporting the prior bogus zero-time fastest result from the summary layer.
+- Updated `README.md` to document the Pollock GPU summary masking behavior.
+
+## 2026-03-13 02:05:00 UTC
+- Refactored Taichi Pollock helper control flow in `simulation/particle_tracking/pollock_gpu.py` to remove early returns inside `@ti.func`, fixing the Taichi 1.6 compiler restriction that broke GPU Pollock kernel compilation.
+- Rewrote `_find_cell_index()` and `_pollock_step()` to use single-return status/output-variable flow without changing the Pollock math or public API.
+- Reverified the touched GPU backend with `python -m py_compile simulation/particle_tracking/pollock_gpu.py` and reran `python tests/test_particle_tracking.py`.
+- Reran the synthetic `compare.py` Pollock smoke path; in this environment Pollock GPU still could not be exercised because `taichi` is not installed, but the script now cleanly skips at import instead of failing at Taichi kernel compilation.
+- Updated `README.md` to record the Taichi control-flow compatibility fix.
+
+## 2026-03-13 01:45:00 UTC
+- Updated `tests/Compare_PAR2_Py/compare.py` so Pollock CPU and Pollock GPU are treated as separate first-class solver entries in the comparison workflow.
+- Replaced the old compare-script Pollock tuple-plus-`fastest_trajectory(...)` flow with `particle_tracking_summary(...)` for both Pollock backends.
+- Added separate compare-script CLI controls `--no-pollock-cpu` and `--no-pollock-gpu`, while keeping `--no-pollock` as a compatibility alias that disables both.
+- Updated compare-script plotting, console summaries, synthetic evaluation, and saved `.npz` outputs to keep Pollock CPU and Pollock GPU results independent.
+- Verified the updated compare script with `python tests/Compare_PAR2_Py/compare.py --help` and a synthetic smoke run using only Pollock CPU/GPU.
+- Confirmed the saved synthetic `.npz` contains separate `pollock_cpu_*` and `pollock_gpu_*` keys.
+- Updated `README.md` to document the separate Pollock CPU/GPU comparison behavior and new CLI flags.
+
 ## 2026-03-13 01:20:00 UTC
 - Split Pollock into a shared core plus explicit CPU/GPU backend modules: added `simulation/particle_tracking/pollock_core.py`, moved the CPU implementation into `simulation/particle_tracking/pollock_cpu.py`, and kept `simulation/particle_tracking/pollock.py` as a compatibility shim.
 - Centralized Pollock status codes, numerical thresholds, and common input parsing so the CPU and GPU backends now share one source of truth for those behaviors.
