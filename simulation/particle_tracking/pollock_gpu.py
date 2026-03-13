@@ -98,19 +98,20 @@ def _make_pollock_tracker():
         @ti.func
         def _find_cell_index(self, grid, n, val):
             idx = -1
-            if val < grid[0] or val > grid[n - 1]:
-                return idx
-            if val == grid[n - 1]:
-                return n - 2
-            low = 0
-            high = n - 1
-            while high - low > 1:
-                mid = (low + high) // 2
-                if val >= grid[mid]:
-                    low = mid
+            if val >= grid[0] and val <= grid[n - 1]:
+                if val == grid[n - 1]:
+                    idx = n - 2
                 else:
-                    high = mid
-            return low
+                    low = 0
+                    high = n - 1
+                    while high - low > 1:
+                        mid = (low + high) // 2
+                        if val >= grid[mid]:
+                            low = mid
+                        else:
+                            high = mid
+                    idx = low
+            return idx
 
         @ti.func
         def _local_nudge(self, span, coord):
@@ -140,93 +141,107 @@ def _make_pollock_tracker():
 
         @ti.func
         def _pollock_step(self, x, y):
+            x_new = x
+            y_new = y
+            dt_exit = 0.0
+            status = STATUS_SUCCESS
             hit_axis = -1
             hit_index = -1
             hit_direction = 0
+
             j = self._find_cell_index(self.x_faces, self.x_faces.shape[0], x)
             i = self._find_cell_index(self.y_faces, self.y_faces.shape[0], y)
             if i == -1 or j == -1:
-                return x, y, 0.0, STATUS_OUT_OF_BOUNDS, hit_axis, hit_index, hit_direction
+                status = STATUS_OUT_OF_BOUNDS
 
-            x1 = self.x_faces[j]
-            x2 = self.x_faces[j + 1]
-            y1 = self.y_faces[i]
-            y2 = self.y_faces[i + 1]
-            dx = x2 - x1
-            dy = y2 - y1
-            if dx <= 0.0 or dy <= 0.0:
-                return x, y, 0.0, STATUS_STAGNATION, hit_axis, hit_index, hit_direction
+            x1 = 0.0
+            x2 = 0.0
+            y1 = 0.0
+            y2 = 0.0
+            dx = 0.0
+            dy = 0.0
+            if status == STATUS_SUCCESS:
+                x1 = self.x_faces[j]
+                x2 = self.x_faces[j + 1]
+                y1 = self.y_faces[i]
+                y2 = self.y_faces[i + 1]
+                dx = x2 - x1
+                dy = y2 - y1
+                if dx <= 0.0 or dy <= 0.0:
+                    status = STATUS_STAGNATION
 
-            v1x = self.vx_faces[i, j]
-            v2x = self.vx_faces[i, j + 1]
-            v1y = self.vy_faces[i, j]
-            v2y = self.vy_faces[i + 1, j]
+            if status == STATUS_SUCCESS:
+                v1x = self.vx_faces[i, j]
+                v2x = self.vx_faces[i, j + 1]
+                v1y = self.vy_faces[i, j]
+                v2y = self.vy_faces[i + 1, j]
 
-            ax = (v2x - v1x) / dx
-            ay = (v2y - v1y) / dy
-            vpx = v1x + ax * (x - x1)
-            vpy = v1y + ay * (y - y1)
+                ax = (v2x - v1x) / dx
+                ay = (v2y - v1y) / dy
+                vpx = v1x + ax * (x - x1)
+                vpy = v1y + ay * (y - y1)
 
-            target_x = x2
-            dtx = POLLOCK_HUGE_DT
-            if vpx > POLLOCK_EPS and v2x > POLLOCK_EPS:
-                target_x = ti.min(x2, self.right_x)
-                v_target = v1x + ax * (target_x - x1)
-                if ti.abs(ax) > POLLOCK_EPS:
-                    dtx = ti.log(v_target / vpx) / ax
-                else:
-                    dtx = (target_x - x) / vpx
-            elif vpx < -POLLOCK_EPS and v1x < -POLLOCK_EPS:
-                if ti.abs(ax) > POLLOCK_EPS:
-                    dtx = ti.log(v1x / vpx) / ax
-                else:
-                    dtx = (x1 - x) / vpx
+                target_x = x2
+                dtx = POLLOCK_HUGE_DT
+                if vpx > POLLOCK_EPS and v2x > POLLOCK_EPS:
+                    target_x = ti.min(x2, self.right_x)
+                    v_target = v1x + ax * (target_x - x1)
+                    if ti.abs(ax) > POLLOCK_EPS:
+                        dtx = ti.log(v_target / vpx) / ax
+                    else:
+                        dtx = (target_x - x) / vpx
+                elif vpx < -POLLOCK_EPS and v1x < -POLLOCK_EPS:
+                    if ti.abs(ax) > POLLOCK_EPS:
+                        dtx = ti.log(v1x / vpx) / ax
+                    else:
+                        dtx = (x1 - x) / vpx
 
-            dty = POLLOCK_HUGE_DT
-            if vpy > POLLOCK_EPS and v2y > POLLOCK_EPS:
-                if ti.abs(ay) > POLLOCK_EPS:
-                    dty = ti.log(v2y / vpy) / ay
-                else:
-                    dty = (y2 - y) / vpy
-            elif vpy < -POLLOCK_EPS and v1y < -POLLOCK_EPS:
-                if ti.abs(ay) > POLLOCK_EPS:
-                    dty = ti.log(v1y / vpy) / ay
-                else:
-                    dty = (y1 - y) / vpy
+                dty = POLLOCK_HUGE_DT
+                if vpy > POLLOCK_EPS and v2y > POLLOCK_EPS:
+                    if ti.abs(ay) > POLLOCK_EPS:
+                        dty = ti.log(v2y / vpy) / ay
+                    else:
+                        dty = (y2 - y) / vpy
+                elif vpy < -POLLOCK_EPS and v1y < -POLLOCK_EPS:
+                    if ti.abs(ay) > POLLOCK_EPS:
+                        dty = ti.log(v1y / vpy) / ay
+                    else:
+                        dty = (y1 - y) / vpy
 
-            dt_exit = ti.min(dtx, dty)
-            if dt_exit == POLLOCK_HUGE_DT or dt_exit <= POLLOCK_EPS or ti.math.isnan(dt_exit):
-                return x, y, 0.0, STATUS_STAGNATION, hit_axis, hit_index, hit_direction
+                dt_exit = ti.min(dtx, dty)
+                if dt_exit == POLLOCK_HUGE_DT or dt_exit <= POLLOCK_EPS or ti.math.isnan(dt_exit):
+                    status = STATUS_STAGNATION
 
-            x_new = x + vpx * dt_exit
-            y_new = y + vpy * dt_exit
-            if ti.abs(ax) > POLLOCK_EPS:
-                x_new = x1 + (vpx * ti.exp(ax * dt_exit) - v1x) / ax
-            if ti.abs(ay) > POLLOCK_EPS:
-                y_new = y1 + (vpy * ti.exp(ay * dt_exit) - v1y) / ay
+                if status == STATUS_SUCCESS:
+                    x_new = x + vpx * dt_exit
+                    y_new = y + vpy * dt_exit
+                    if ti.abs(ax) > POLLOCK_EPS:
+                        x_new = x1 + (vpx * ti.exp(ax * dt_exit) - v1x) / ax
+                    if ti.abs(ay) > POLLOCK_EPS:
+                        y_new = y1 + (vpy * ti.exp(ay * dt_exit) - v1y) / ay
 
-            if dtx < dty:
-                if vpx > 0.0:
-                    x_new = target_x
-                    hit_index = j + 1
-                    hit_direction = 1
-                else:
-                    x_new = x1
-                    hit_index = j
-                    hit_direction = -1
-                hit_axis = 0
-            else:
-                if vpy > 0.0:
-                    y_new = y2
-                    hit_index = i + 1
-                    hit_direction = 1
-                else:
-                    y_new = y1
-                    hit_index = i
-                    hit_direction = -1
-                hit_axis = 1
+                    if dtx < dty:
+                        if vpx > 0.0:
+                            x_new = target_x
+                            hit_index = j + 1
+                            hit_direction = 1
+                        else:
+                            x_new = x1
+                            hit_index = j
+                            hit_direction = -1
+                        hit_axis = 0
+                    else:
+                        if vpy > 0.0:
+                            y_new = y2
+                            hit_index = i + 1
+                            hit_direction = 1
+                        else:
+                            y_new = y1
+                            hit_index = i
+                            hit_direction = -1
+                        hit_axis = 1
 
-            return x_new, y_new, dt_exit, STATUS_SUCCESS, hit_axis, hit_index, hit_direction
+            return x_new, y_new, dt_exit, status, hit_axis, hit_index, hit_direction
 
         @ti.kernel
         def init_state(self):
@@ -345,7 +360,8 @@ def particle_tracking_pollock_gpu_summary(params):
     _ensure_ti_init()
     PollockTracking2D = _make_pollock_tracker()
     tracker = PollockTracking2D(x_faces, y_faces, vx, vy, seeds_x, seeds_y, right_x, max_steps)
-    travel_times, status = tracker.run()
+    raw_travel_times, status = tracker.run()
+    travel_times = np.where(status == STATUS_SUCCESS, raw_travel_times, np.nan).astype(np.float32)
     summary = summarize_arrivals(travel_times, status, stop_mode=stop_mode, arrival_fraction=arrival_fraction)
     summary.update(
         {

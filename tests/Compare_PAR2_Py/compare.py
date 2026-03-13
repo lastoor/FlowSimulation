@@ -36,7 +36,7 @@ from simulation.hydraulic import read_mt3d_file, run_modflow, write_mt3d_file
 from simulation.particle_tracking import (
     fastest_trajectory,
     particle_tracking_cpu,
-    particle_tracking_pollock,
+    particle_tracking_summary,
     gpu_track_particles_arclength,
     run_par2,
 )
@@ -216,9 +216,9 @@ def _build_coordinate_mesh(x_coords, y_coords):
 
 def _synthetic_lane_specs(nx, ny):
     return [
-        {"name": "lane0", "y0": 0.28 * ny, "amp": 5.5, "freq": 1.2, "phase": 0.2, "boost": 0.05, "width": 2.4},
-        {"name": "lane1", "y0": 0.52 * ny, "amp": 8.0, "freq": 4.0, "phase": 1.0, "boost": 10.0, "width": 2.2},
-        {"name": "lane2", "y0": 0.72 * ny, "amp": 4.5, "freq": 0.9, "phase": -0.6, "boost": 0.05, "width": 2.6},
+        {"name": "lane0", "y0": 0.28 * ny, "amp": 5.5, "freq": 10, "phase": 0.2, "boost": 5, "width": 2.4},
+        {"name": "lane1", "y0": 0.52 * ny, "amp": 8.0, "freq": 15.0, "phase": 1.0, "boost": 40.0, "width": 2.2},
+        {"name": "lane2", "y0": 0.72 * ny, "amp": 4.5, "freq": 10, "phase": -0.6, "boost": 5, "width": 2.6},
     ]
 
 
@@ -465,7 +465,8 @@ def _save_comparison_figure(
     title,
     vx,
     vy,
-    pollock_res,
+    pollock_cpu_res,
+    pollock_gpu_res,
     rk45_cpu_res,
     rk45_gpu_res,
     rk4_fp_res,
@@ -523,14 +524,24 @@ def _save_comparison_figure(
             label="Expected fastest lane",
         )
 
-    if pollock_res is not None:
+    if pollock_cpu_res is not None:
         ax.plot(
-            pollock_res["x"],
-            pollock_res["y"],
+            pollock_cpu_res["x"],
+            pollock_cpu_res["y"],
             color="#FF7F0E",
             lw=2.0,
             ls="--",
-            label=f'Fastest Path (Pollock), t={pollock_res["travel_time"]:.3g}',
+            label=f'Fastest Path (Pollock CPU), t={pollock_cpu_res["travel_time"]:.3g}',
+        )
+
+    if pollock_gpu_res is not None:
+        ax.plot(
+            pollock_gpu_res["x"],
+            pollock_gpu_res["y"],
+            color="#FFB366",
+            lw=2.0,
+            ls="-.",
+            label=f'Fastest Path (Pollock GPU), t={pollock_gpu_res["travel_time"]:.3g}',
         )
 
     if rk45_cpu_res is not None:
@@ -623,7 +634,17 @@ def _parse_args():
     p.add_argument(
         "--no-pollock",
         action="store_true",
-        help="Do not run Pollock in the comparison.",
+        help="Compatibility alias: do not run either Pollock CPU or Pollock GPU in the comparison.",
+    )
+    p.add_argument(
+        "--no-pollock-cpu",
+        action="store_true",
+        help="Do not run Pollock CPU in the comparison.",
+    )
+    p.add_argument(
+        "--no-pollock-gpu",
+        action="store_true",
+        help="Do not run Pollock GPU in the comparison.",
     )
     p.add_argument(
         "--no-rk45-gpu",
@@ -642,12 +663,13 @@ def _parse_args():
     )
     args = p.parse_args()
     use_par2 = not args.no_par2
-    use_pollock = not args.no_pollock
+    use_pollock_cpu = not (args.no_pollock or args.no_pollock_cpu)
+    use_pollock_gpu = not (args.no_pollock or args.no_pollock_gpu)
     use_rk45_cpu = not args.no_rk45_cpu
     use_rk45_gpu = not args.no_rk45_gpu
     use_rk4_fp = not args.no_rk4_fp
     use_modpath = not args.no_modpath
-    if not (use_par2 or use_pollock or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_modpath):
+    if not (use_par2 or use_pollock_cpu or use_pollock_gpu or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_modpath):
         p.error("At least one algorithm must be enabled (do not pass all --no-* flags).")
     return argparse.Namespace(
         test_case=args.test_case,
@@ -655,7 +677,8 @@ def _parse_args():
         synthetic_time_gap_min=float(args.synthetic_time_gap_min),
         velocity_location=args.velocity_location,
         use_par2=use_par2,
-        use_pollock=use_pollock,
+        use_pollock_cpu=use_pollock_cpu,
+        use_pollock_gpu=use_pollock_gpu,
         use_rk45_cpu=use_rk45_cpu,
         use_rk45_gpu=use_rk45_gpu,
         use_rk4_fp=use_rk4_fp,
@@ -917,21 +940,39 @@ def _run_case(
         "dt": dt_compare,
         "max_steps": max_steps_compare,
     }
-    pollock_res = None
-    if opts.use_pollock:
-        pollock_params = {
-            "x_faces": x_faces,
-            "y_faces": y_faces,
-            "vx": vx_full,
-            "vy": vy_full,
-            "seeds_x": seeds_x,
-            "seeds_y": seeds_y,
-            "right_x": right_x,
-            "max_points": max_points,
-            "max_steps": max_steps_compare,
-        }
-        px_p, py_p, pt_p, L_p, st_p = particle_tracking_pollock(pollock_params)
-        pollock_res = fastest_trajectory(px_p, py_p, pt_p, L_p, st_p)
+    pollock_params = {
+        "method": "pollock",
+        "tracking_mode": "arrival",
+        "stop_mode": "first",
+        "save_trajectories": True,
+        "return_fastest": True,
+        "x_faces": x_faces,
+        "y_faces": y_faces,
+        "vx": vx_full,
+        "vy": vy_full,
+        "seeds_x": seeds_x,
+        "seeds_y": seeds_y,
+        "right_x": right_x,
+        "max_points": max_points,
+        "max_steps": max_steps_compare,
+    }
+    pollock_cpu_res = None
+    if opts.use_pollock_cpu:
+        try:
+            pollock_cpu_summary = particle_tracking_summary({**pollock_params, "backend": "cpu"})
+            pollock_cpu_res = pollock_cpu_summary.get("fastest")
+            print("Pollock CPU fastest path computed.")
+        except Exception as e:
+            print(f"Warning: Pollock CPU skipped ({e}).")
+
+    pollock_gpu_res = None
+    if opts.use_pollock_gpu:
+        try:
+            pollock_gpu_summary = particle_tracking_summary({**pollock_params, "backend": "gpu"})
+            pollock_gpu_res = pollock_gpu_summary.get("fastest")
+            print("Pollock GPU fastest path computed.")
+        except Exception as e:
+            print(f"Warning: Pollock GPU skipped ({e}).")
 
     rk45_cpu_res = None
     if opts.use_rk45_cpu:
@@ -1001,8 +1042,10 @@ def _run_case(
     print(f"\n--- Fastest path travel times ({case_name}) ---")
     if opts.use_par2:
         print(f"  PAR2:      {par2_fast_time:.6g}" if np.isfinite(par2_fast_time) else "  PAR2:      (not available)")
-    if opts.use_pollock:
-        print(f"  Pollock:   {pollock_res['travel_time']:.6g}" if pollock_res is not None else "  Pollock:   (skipped)")
+    if opts.use_pollock_cpu:
+        print(f"  Pollock CPU: {pollock_cpu_res['travel_time']:.6g}" if pollock_cpu_res is not None else "  Pollock CPU: (skipped)")
+    if opts.use_pollock_gpu:
+        print(f"  Pollock GPU: {pollock_gpu_res['travel_time']:.6g}" if pollock_gpu_res is not None else "  Pollock GPU: (skipped)")
     if opts.use_rk45_cpu and rk45_cpu_res is not None:
         print(f"  RK45 CPU:  {rk45_cpu_res['travel_time']:.6g}")
     if opts.use_rk45_gpu:
@@ -1030,14 +1073,22 @@ def _run_case(
         "vy_cell_from_faces": np.asarray(vy_cell_from_faces, dtype=np.float64),
         "par2_time": par2_fast_time,
     }
-    if pollock_res is not None:
-        save_kw["pollock_x"] = pollock_res["x"]
-        save_kw["pollock_y"] = pollock_res["y"]
-        save_kw["pollock_time"] = pollock_res["travel_time"]
+    if pollock_cpu_res is not None:
+        save_kw["pollock_cpu_x"] = pollock_cpu_res["x"]
+        save_kw["pollock_cpu_y"] = pollock_cpu_res["y"]
+        save_kw["pollock_cpu_time"] = pollock_cpu_res["travel_time"]
     else:
-        save_kw["pollock_x"] = np.array([], dtype=np.float64)
-        save_kw["pollock_y"] = np.array([], dtype=np.float64)
-        save_kw["pollock_time"] = np.nan
+        save_kw["pollock_cpu_x"] = np.array([], dtype=np.float64)
+        save_kw["pollock_cpu_y"] = np.array([], dtype=np.float64)
+        save_kw["pollock_cpu_time"] = np.nan
+    if pollock_gpu_res is not None:
+        save_kw["pollock_gpu_x"] = pollock_gpu_res["x"]
+        save_kw["pollock_gpu_y"] = pollock_gpu_res["y"]
+        save_kw["pollock_gpu_time"] = pollock_gpu_res["travel_time"]
+    else:
+        save_kw["pollock_gpu_x"] = np.array([], dtype=np.float64)
+        save_kw["pollock_gpu_y"] = np.array([], dtype=np.float64)
+        save_kw["pollock_gpu_time"] = np.nan
     if rk45_cpu_res is not None:
         save_kw["rk45_cpu_x"] = rk45_cpu_res["x"]
         save_kw["rk45_cpu_y"] = rk45_cpu_res["y"]
@@ -1089,7 +1140,8 @@ def _run_case(
             expected_synthetic,
             {
                 "PAR2": None if par2_fast is None else {"x": par2_fast[:, 0], "y": par2_fast[:, 1], "travel_time": par2_fast_time},
-                "Pollock": pollock_res,
+                "Pollock CPU": pollock_cpu_res,
+                "Pollock GPU": pollock_gpu_res,
                 "RK45 CPU": rk45_cpu_res,
                 "RK45 GPU": rk45_gpu_res,
                 "RK4 FP": rk4_fp_res,
@@ -1114,7 +1166,8 @@ def _run_case(
         title=title,
         vx=vx_plot,
         vy=vy_plot,
-        pollock_res=pollock_res,
+        pollock_cpu_res=pollock_cpu_res,
+        pollock_gpu_res=pollock_gpu_res,
         rk45_cpu_res=rk45_cpu_res,
         rk45_gpu_res=rk45_gpu_res,
         rk4_fp_res=rk4_fp_res,
@@ -1131,7 +1184,8 @@ def _run_case(
             title=title,
             vx=vx_plot,
             vy=vy_plot,
-            pollock_res=pollock_res,
+            pollock_cpu_res=pollock_cpu_res,
+            pollock_gpu_res=pollock_gpu_res,
             rk45_cpu_res=rk45_cpu_res,
             rk45_gpu_res=rk45_gpu_res,
             rk4_fp_res=rk4_fp_res,
