@@ -143,3 +143,13 @@
 - Kept output structure compatible with the existing `simulation/main.py` style.
 - Added CLI validation and syntax checks for `scripts/run.py`.
 - Updated `README.md` with run instructions, CLI reference, and output layout.
+
+
+## 2026-04-13
+- Added Pollock GPU snapshot support in `simulation/particle_tracking/pollock_gpu.py`.
+- Extended the Taichi tracker to accept optional `snapshot_times`, capture interpolated `(x, y)` particle positions at those times, and return `(travel_times, status, snap_x, snap_y)` from `run()`.
+- Added summary-layer snapshot handling in `particle_tracking_pollock_gpu_summary(...)` with `snapshot_mode` / `snapshot_times`, including two-pass resolution for `dt_interval` and `fraction_of_first_arrival`.
+- Updated `README.md` to document the new Pollock GPU snapshot behavior.
+- Validation:
+  - `python -m py_compile simulation/particle_tracking/pollock_gpu.py`
+

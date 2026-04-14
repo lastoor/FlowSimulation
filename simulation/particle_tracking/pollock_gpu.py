@@ -50,7 +50,7 @@ def _make_pollock_tracker():
 
     @ti.data_oriented
     class PollockTracking2D:
-        def __init__(self, x_faces, y_faces, vx_faces, vy_faces, seeds_x, seeds_y, right_x, max_steps):
+        def __init__(self, x_faces, y_faces, vx_faces, vy_faces, seeds_x, seeds_y, right_x, max_steps, snapshot_times=None):
             x_faces = np.asarray(x_faces, dtype=np.float32).ravel()
             y_faces = np.asarray(y_faces, dtype=np.float32).ravel()
             vx_faces = np.asarray(vx_faces, dtype=np.float32)
@@ -94,6 +94,22 @@ def _make_pollock_tracker():
             self._y_faces_np = y_faces
             self._vx_faces_np = vx_faces
             self._vy_faces_np = vy_faces
+
+            # Snapshot fields
+            if snapshot_times is not None and len(snapshot_times) > 0:
+                snap_np = np.sort(np.asarray(snapshot_times, dtype=np.float32).ravel())
+                self.n_snaps = snap_np.size
+                self.snap_times = ti.field(dtype=ti.f32, shape=self.n_snaps)
+                self.snap_x = ti.field(dtype=ti.f32, shape=(self.n_particles, self.n_snaps))
+                self.snap_y = ti.field(dtype=ti.f32, shape=(self.n_particles, self.n_snaps))
+                self.snap_times.from_numpy(snap_np)
+                self.snap_x.from_numpy(np.full((self.n_particles, self.n_snaps), np.nan, dtype=np.float32))
+                self.snap_y.from_numpy(np.full((self.n_particles, self.n_snaps), np.nan, dtype=np.float32))
+            else:
+                self.n_snaps = 0
+                self.snap_times = ti.field(dtype=ti.f32, shape=1)
+                self.snap_x = ti.field(dtype=ti.f32, shape=(1, 1))
+                self.snap_y = ti.field(dtype=ti.f32, shape=(1, 1))
 
         @ti.func
         def _find_cell_index(self, grid, n, val):
@@ -257,10 +273,25 @@ def _make_pollock_tracker():
                     self.status[i] = STATUS_SUCCESS
                     self.active[i] = 0
 
+        @ti.func
+        def _capture_snapshots(self, i: ti.i32, snap_idx: ti.i32, prev_x: ti.f32, prev_y: ti.f32, prev_t: ti.f32, curr_x: ti.f32, curr_y: ti.f32, curr_t: ti.f32) -> ti.i32:
+            """Capture any snapshot times that fall within [prev_t, curr_t]."""
+            idx = snap_idx
+            while idx < self.n_snaps and self.snap_times[idx] <= curr_t:
+                t_s = self.snap_times[idx]
+                if t_s >= prev_t:
+                    dt_step = curr_t - prev_t + 1e-30
+                    alpha = (t_s - prev_t) / dt_step
+                    self.snap_x[i, idx] = prev_x + alpha * (curr_x - prev_x)
+                    self.snap_y[i, idx] = prev_y + alpha * (curr_y - prev_y)
+                idx += 1
+            return idx
+
         @ti.kernel
         def track_all(self):
             for i in range(self.n_particles):
                 steps = 0
+                snap_idx = 0
                 while self.active[i] == 1 and steps < self.max_steps:
                     prev_x = self.pos_x[i]
                     prev_y = self.pos_y[i]
@@ -275,6 +306,10 @@ def _make_pollock_tracker():
                         curr_t = prev_t + dt
                         curr_x = next_x
                         curr_y = next_y
+
+                        # Capture snapshots in [prev_t, curr_t]
+                        if self.n_snaps > 0 and snap_idx < self.n_snaps:
+                            snap_idx = self._capture_snapshots(i, snap_idx, prev_x, prev_y, prev_t, curr_x, curr_y, curr_t)
 
                         self.pos_x[i] = curr_x
                         self.pos_y[i] = curr_y
@@ -310,7 +345,15 @@ def _make_pollock_tracker():
             import taichi as ti
 
             ti.sync()
-            return self.final_times.to_numpy(), self.status.to_numpy()
+            travel_times = self.final_times.to_numpy()
+            status = self.status.to_numpy()
+            if self.n_snaps > 0:
+                snap_x = self.snap_x.to_numpy()
+                snap_y = self.snap_y.to_numpy()
+            else:
+                snap_x = None
+                snap_y = None
+            return travel_times, status, snap_x, snap_y
 
         def replay_selected(self, particle_ids, right_x, max_points, max_steps):
             trajectories = []
@@ -340,6 +383,49 @@ def _make_pollock_tracker():
     return _tracker_cls
 
 
+def _resolve_snapshot_times(snapshot_mode, raw_snapshot_times, travel_times):
+    """Resolve snapshot times from user parameters into absolute physical times.
+
+    Parameters
+    ----------
+    snapshot_mode : str
+        One of ``"physical"``, ``"dt_interval"``, ``"fraction_of_first_arrival"``.
+    raw_snapshot_times : array-like or scalar
+        For ``"physical"``: 1-D array of absolute times.
+        For ``"dt_interval"``: scalar dt.
+        For ``"fraction_of_first_arrival"``: 1-D array of fractions (values > 1.0 allowed).
+    travel_times : ndarray
+        Per-particle travel times (NaN for unsuccessful particles).
+
+    Returns
+    -------
+    ndarray (T,) of sorted absolute snapshot times, or None if resolution fails.
+    """
+    if snapshot_mode == "physical":
+        return np.sort(np.asarray(raw_snapshot_times, dtype=np.float32).ravel())
+
+    valid_times = travel_times[np.isfinite(travel_times)]
+    if valid_times.size == 0:
+        return None
+
+    if snapshot_mode == "dt_interval":
+        dt = float(raw_snapshot_times)
+        t_max = float(np.max(valid_times))
+        if dt <= 0 or t_max <= 0:
+            return None
+        return np.arange(dt, t_max + dt * 0.5, dt, dtype=np.float32)
+
+    if snapshot_mode == "fraction_of_first_arrival":
+        t_first = float(np.min(valid_times))
+        if t_first <= 0:
+            return None
+        fractions = np.sort(np.asarray(raw_snapshot_times, dtype=np.float32).ravel())
+        return (fractions * t_first).astype(np.float32)
+
+    raise ValueError(f"Unknown snapshot_mode: {snapshot_mode!r}. "
+                     "Must be 'physical', 'dt_interval', or 'fraction_of_first_arrival'.")
+
+
 def particle_tracking_pollock_gpu_summary(params):
     """Taichi-based GPU Pollock summary backend."""
     tracking_mode = params.get("tracking_mode", "arrival")
@@ -357,10 +443,29 @@ def particle_tracking_pollock_gpu_summary(params):
 
     x_faces, y_faces, vx, vy, seeds_x, seeds_y, right_x, max_points, max_steps = parse_pollock_inputs(params)
 
+    snapshot_mode = params.get("snapshot_mode", None)
+    raw_snapshot_times = params.get("snapshot_times", None)
+
     _ensure_ti_init()
     PollockTracking2D = _make_pollock_tracker()
-    tracker = PollockTracking2D(x_faces, y_faces, vx, vy, seeds_x, seeds_y, right_x, max_steps)
-    raw_travel_times, status = tracker.run()
+
+    # Determine if we need a two-pass approach for snapshot resolution
+    resolved_snap_times = None
+    if snapshot_mode is not None and raw_snapshot_times is not None:
+        if snapshot_mode == "physical":
+            # Single pass: snapshot times are known upfront
+            resolved_snap_times = _resolve_snapshot_times(snapshot_mode, raw_snapshot_times, None)
+        else:
+            # Two-pass: first run without snapshots to get arrival times
+            tracker_pass1 = PollockTracking2D(x_faces, y_faces, vx, vy, seeds_x, seeds_y, right_x, max_steps)
+            raw_travel_times_p1, status_p1, _, _ = tracker_pass1.run()
+            travel_times_p1 = np.where(status_p1 == STATUS_SUCCESS, raw_travel_times_p1, np.nan).astype(np.float32)
+            resolved_snap_times = _resolve_snapshot_times(snapshot_mode, raw_snapshot_times, travel_times_p1)
+
+    # Main tracking run (with snapshot capture if resolved)
+    tracker = PollockTracking2D(x_faces, y_faces, vx, vy, seeds_x, seeds_y, right_x, max_steps,
+                                snapshot_times=resolved_snap_times)
+    raw_travel_times, status, snap_x, snap_y = tracker.run()
     travel_times = np.where(status == STATUS_SUCCESS, raw_travel_times, np.nan).astype(np.float32)
     summary = summarize_arrivals(travel_times, status, stop_mode=stop_mode, arrival_fraction=arrival_fraction)
     summary.update(
@@ -392,5 +497,14 @@ def particle_tracking_pollock_gpu_summary(params):
         else:
             traj = tracker.replay_selected(np.array([fastest_id], dtype=np.int32), right_x, max_points, max_steps)[0]
             summary["fastest"] = build_fastest_result_from_trajectory(fastest_id, travel_times[fastest_id], traj)
+
+    # Attach snapshots
+    if resolved_snap_times is not None and snap_x is not None:
+        summary["snapshots"] = {
+            "snapshot_mode": snapshot_mode,
+            "snapshot_times": resolved_snap_times,
+            "x": snap_x,
+            "y": snap_y,
+        }
 
     return summary

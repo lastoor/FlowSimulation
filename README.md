@@ -138,6 +138,7 @@ Per-MC file:
 - If Taichi GPU initialization fails, Pollock GPU now emits a warning before falling back to the Taichi CPU backend.
 - The Taichi Pollock helper functions have also been refactored to avoid unsupported early returns inside `@ti.func`, which is required for Taichi 1.6 compatibility.
 - GPU Pollock summary results now mask non-success particle times before arrival ordering / fastest-particle selection, so failed particles cannot be incorrectly reported as zero-time “fastest” arrivals.
+- GPU Pollock summary now also supports snapshot capture through `snapshot_mode` / `snapshot_times`; physical snapshot times are handled in one pass, while `dt_interval` and `fraction_of_first_arrival` use a first pass to resolve absolute times before rerunning with snapshot buffers attached.
 
 Example:
 ```python
