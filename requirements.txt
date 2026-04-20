@@ -1,0 +1,20 @@
+# Core runtime
+numpy
+scipy
+petsc4py
+numba
+PyYAML
+
+# Visualization / analysis
+matplotlib
+cmcrameri
+xarray
+ipython
+
+# Flow / transport tooling used by comparison and trajectory workflows
+flopy
+parcels
+
+# Optional GPU / accelerated backends used by selected paths
+cupy
+taichi

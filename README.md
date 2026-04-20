@@ -27,6 +27,14 @@ Typical runtime dependencies include:
 - `taichi` (for RK4 GPU and Pollock GPU summary paths)
 - Optional: CUDA-capable environment and `nvidia-smi`
 
+Install the repository requirements with:
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` includes the core runtime packages plus comparison / visualization dependencies that are imported by scripts and tests. GPU-oriented packages such as `cupy` and `taichi` are included for environments that use those paths.
+
 ## Run the new hybrid script
 Use exactly one of `--std` or `--c`.
 
@@ -218,6 +226,7 @@ python tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py \
 ```
 
 ## Possible issues
+- `requirements.txt` includes optional GPU-oriented packages such as `cupy` and `taichi`; these may require environment-specific installation steps on machines without compatible GPU support.
 
 1. `solve_head` still defaults to `spacing_mode="uniform"` for backward compatibility; callers must opt in to `spacing_mode="center_faces"` to use coordinate-derived spacing.
 2. Boundary gradients in `compute_velocity` are still one-sided; higher-order boundary discretization remains a separate improvement.

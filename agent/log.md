@@ -90,6 +90,7 @@
 - Added deterministic zero-variance handling in `simulation/grf_generation.py` for degenerate random fields.
 - Updated `compute_c(..., std_target=0)` to return `0.0` and made `fBmGenerator(c=0, ...)` return a uniform zero `logk_field`.
 - Updated `ExpCov(sigma=0, ...)` and `GaussianRandomFieldCircEmbed(...)` so zero covariance scale returns the configured mean field instead of sampling through the FFT path.
+- Added `requirements.txt` and README installation notes for the repository's Python dependencies.
 - Added GRF tests covering zero `std`, zero `c`, zero `sigma`, and zero-scale `generate_logk_field(...)`.
 - Verified the GRF test module with `python tests/test_grf_generation.py`.
 - Updated `README.md` to document the zero-variance uniform-field behavior.
@@ -152,4 +153,3 @@
 - Updated `README.md` to document the new Pollock GPU snapshot behavior.
 - Validation:
   - `python -m py_compile simulation/particle_tracking/pollock_gpu.py`
-
