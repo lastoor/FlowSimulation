@@ -362,6 +362,7 @@ class TestParticleTracking(unittest.TestCase):
             self.skipTest(f"Taichi GPU Pollock summary unavailable in this environment: {exc}")
 
         self.assertEqual(summary["backend"], "gpu")
+        self.assertIn(summary.get("taichi_arch"), {"gpu", "cpu"})
         self.assertEqual(summary["method"], "pollock")
         self.assertEqual(summary["target_arrivals"], 1)
         self.assertEqual(summary["stopping_particle_id"], 1)
@@ -565,10 +566,64 @@ class TestParticleTracking(unittest.TestCase):
             with mock.patch("taichi.init", side_effect=[RuntimeError("gpu unavailable"), None]) as init_mock:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
-                    pollock_gpu._ensure_ti_init()
+                    arch = pollock_gpu._ensure_ti_init()
 
+        self.assertEqual(arch, "cpu")
         self.assertEqual(init_mock.call_count, 2)
         self.assertTrue(any("falling back to Taichi CPU backend" in str(w.message) for w in caught))
+
+    def test_pollock_gpu_summary_reports_cpu_taichi_fallback(self):
+        try:
+            from simulation.particle_tracking import pollock_gpu
+        except Exception as exc:
+            self.skipTest(f"Pollock GPU module unavailable in this environment: {exc}")
+
+        fake_summary = {
+            "n_arrived": 1,
+            "status": np.array([0], dtype=np.int32),
+            "selected_particle_ids": np.array([0], dtype=np.int32),
+            "stopping_particle_id": 0,
+            "stopping_travel_time": 1.0,
+            "target_arrivals": 1,
+            "threshold_reached": True,
+        }
+        fake_traj = {"particle_id": 0, "x": np.array([0.0, 1.0]), "y": np.array([0.0, 0.0]), "t": np.array([0.0, 1.0])}
+
+        class _FakeTracker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self):
+                return np.array([1.0], dtype=np.float32), np.array([0], dtype=np.int32), None, None
+
+            def replay_selected(self, particle_ids, right_x, max_points, max_steps):
+                return [fake_traj]
+
+        params = {
+            "tracking_mode": "arrival",
+            "stop_mode": "first",
+            "return_fastest": True,
+            "save_trajectories": False,
+            "x_faces": np.array([0.0, 1.0], dtype=np.float32),
+            "y_faces": np.array([0.0, 1.0], dtype=np.float32),
+            "vx": np.ones((1, 2), dtype=np.float32),
+            "vy": np.zeros((2, 1), dtype=np.float32),
+            "seeds_x": np.array([0.0], dtype=np.float32),
+            "seeds_y": np.array([0.0], dtype=np.float32),
+            "right_x": 1.0,
+            "max_points": 8,
+            "max_steps": 8,
+        }
+
+        with mock.patch.object(pollock_gpu, "_ensure_ti_init", return_value="cpu"):
+            with mock.patch.object(pollock_gpu, "_make_pollock_tracker", return_value=_FakeTracker):
+                with mock.patch.object(pollock_gpu, "summarize_arrivals", return_value=fake_summary):
+                    with mock.patch.object(pollock_gpu, "fastest_particle_id", return_value=0):
+                        with mock.patch.object(pollock_gpu, "build_fastest_result_from_trajectory", return_value={"x": fake_traj["x"], "y": fake_traj["y"], "t": fake_traj["t"], "travel_time": 1.0}):
+                            summary = pollock_gpu.particle_tracking_pollock_gpu_summary(params)
+
+        self.assertEqual(summary["backend"], "gpu")
+        self.assertEqual(summary["taichi_arch"], "cpu")
 
     def test_pollock_gpu_tracker_rerun_resets_to_seeds(self):
         try:

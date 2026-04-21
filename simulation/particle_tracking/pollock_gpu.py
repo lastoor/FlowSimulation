@@ -21,17 +21,19 @@ from .pollock_cpu import (
 from .utils import build_fastest_result_from_trajectory, fastest_particle_id, summarize_arrivals
 
 _ti_initialized = False
+_ti_arch = None
 _tracker_cls = None
 
 
 def _ensure_ti_init():
-    global _ti_initialized
+    global _ti_initialized, _ti_arch
     if _ti_initialized:
-        return
+        return _ti_arch
     import taichi as ti
 
     try:
         ti.init(arch=ti.gpu, verbose=False)
+        _ti_arch = "gpu"
     except Exception as exc:
         warnings.warn(
             f"Taichi GPU initialization failed; falling back to Taichi CPU backend ({exc}).",
@@ -39,7 +41,9 @@ def _ensure_ti_init():
             stacklevel=2,
         )
         ti.init(arch=ti.cpu, verbose=False)
+        _ti_arch = "cpu"
     _ti_initialized = True
+    return _ti_arch
 
 
 def _make_pollock_tracker():
@@ -446,7 +450,7 @@ def particle_tracking_pollock_gpu_summary(params):
     snapshot_mode = params.get("snapshot_mode", None)
     raw_snapshot_times = params.get("snapshot_times", None)
 
-    _ensure_ti_init()
+    taichi_arch = _ensure_ti_init()
     PollockTracking2D = _make_pollock_tracker()
 
     # Determine if we need a two-pass approach for snapshot resolution
@@ -471,6 +475,7 @@ def particle_tracking_pollock_gpu_summary(params):
     summary.update(
         {
             "backend": "gpu",
+            "taichi_arch": taichi_arch,
             "method": "pollock",
             "tracking_mode": tracking_mode,
             "stop_mode": stop_mode,
