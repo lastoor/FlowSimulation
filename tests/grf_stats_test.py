@@ -170,7 +170,6 @@ if __name__ == "__main__":
 
     lags, gamma_iso = empirical_variogram(fields)
     gamma_theory    = gamma_theory_fn(lags)
-    lags_normed     = lags / (num_pt - 1)
 
     # ── covariance estimation (reuses the same MC fields, subsampled) ───────────
     pts_cov, Sigma_hat = estimate_cov_from_fields(fields, stride=cov_stride)
@@ -202,13 +201,13 @@ if __name__ == "__main__":
     div1 = make_axes_locatable(ax2)
     fig.colorbar(im1, cax=div1.append_axes("right", size="5%", pad=0.05))
 
-    ax3.plot(lags_normed, gamma_iso, color='#444444', linewidth=3, label="Estimated")
-    line, = ax3.plot(lags_normed, gamma_theory, color='#FFFFFF', linewidth=1, linestyle='--', label=theory_label)
+    ax3.plot(lags, gamma_iso, color='#444444', linewidth=3, label="Estimated")
+    line, = ax3.plot(lags, gamma_theory, color='#FFFFFF', linewidth=1, linestyle='--', label=theory_label)
     line.set_path_effects([pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
     line.set_solid_capstyle("round")
     line.set_dash_capstyle("round")
-    
-    ax3.set_xlabel("Normalized lag $h / (N-1)$")
+
+    ax3.set_xlabel("Lag $h$")
     ax3.set_ylabel(r"$\hat{\gamma}(h)$")
     ax3.set_title(rf"Ensemble Variogram ($\epsilon = {rel_err_vario:.3f}$)")
     ax3.legend()
