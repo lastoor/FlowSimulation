@@ -6,7 +6,8 @@ import os
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
+import matplotlib.patheffects as pe
+import cmcrameri.cm as cmc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from simulation.grf_generation import fBmGenerator, GaussianRandomFieldCircEmbed, ExpCov
@@ -62,55 +63,32 @@ def empirical_variogram(fields, max_lag=None):
         gamma_iso[idx] = np.var(np.concatenate(diffs_all), ddof=1) / 2
     return lags, gamma_iso
 
-def estimate_cov_full(gen, n_real=2000):
+
+def estimate_cov_from_fields(fields, stride=1):
     """
-    gen.sample(): returns a (N,N) field from your fBmGenerator.
-    n_real: number of realizations for Monte Carlo.
-    
-    Returns:
-        pts: (M, 2) array of grid coordinates
-        Sigma_hat: (M, M) empirical covariance matrix
+    Compute empirical covariance from pre-generated fields, optionally subsampled.
+
+    fields: (n_real, N, N)
+    stride: take every stride-th grid point along each axis for efficiency
+    Returns pts (M, 2), Sigma_hat (M, M)
     """
-    Z0 = gen.sample()
-    N = Z0.shape[0]
-    M = N * N
+    n_real, N, _ = fields.shape
+    sub = fields[:, ::stride, ::stride]   # (n_real, n_sub, n_sub)
+    n_sub = sub.shape[1]
+    M = n_sub * n_sub
 
-    # stack flattened realizations column-wise
-    X = np.empty((M, n_real), dtype=float)
-    X[:, 0] = Z0.ravel()
-
-    for k in range(1, n_real):
-        Z = gen.sample()
-        X[:, k] = Z.ravel()
-
-    # subtract mean at each point (row-wise)
+    X = sub.reshape(n_real, M).T          # (M, n_real)
     X -= X.mean(axis=1, keepdims=True)
+    Sigma_hat = (X @ X.T) / n_real
 
-    # empirical covariance Σ̂ ≈ E[Z Z^T]
-    Sigma_hat = (X @ X.T) / n_real  # shape (M, M)
-
-    # construct coordinates corresponding to each index
-    N = Z0.shape[0]
-    x = np.arange(N) / N
-    y = np.arange(N) / N
-    Xg, Yg = np.meshgrid(x, y, indexing="ij")
-    pts = np.stack([Xg.ravel(), Yg.ravel()], axis=1)  # shape (M,2)
+    # grid coords consistent with generator convention: arange(N)/N, subsampled
+    idx = np.arange(0, N, stride)
+    coords = idx / N
+    Xg, Yg = np.meshgrid(coords, coords, indexing='ij')
+    pts = np.stack([Xg.ravel(), Yg.ravel()], axis=1)  # (M, 2)
 
     return pts, Sigma_hat
 
-def fBs_cov_matrix(H, L, N, c):
-    x = np.linspace(0, L, N)
-    y = np.linspace(0, L, N)
-    Xg, Yg = np.meshgrid(x, y, indexing='ij')
-    pts = np.stack([Xg.ravel(), Yg.ravel()], axis=1)  # (M,2)
-    M = N * N
-
-    diff = pts[:, None, :] - pts[None, :, :]
-    r = np.linalg.norm(diff, axis=2)
-    p_norm2H = np.linalg.norm(pts, axis=1)**(2*H)
-
-    Sigma_th = c * (p_norm2H[:, None] + p_norm2H[None, :] - r**(2*H))
-    return Sigma_th
 
 # ─── main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -119,7 +97,8 @@ if __name__ == "__main__":
                         help="Generator type: 'fbm' (fractional Brownian motion) "
                              "or 'exp' (exponential covariance)")
     parser.add_argument("--num_pt",      type=int,   default=512)
-    parser.add_argument("--num_mc",      type=int,   default=10)
+    parser.add_argument("--num_mc",      type=int,   default=10,
+                        help="MC realizations (shared by variogram and covariance estimation)")
     parser.add_argument("--minpadding",  type=int,   default=0)
     # fBm params
     parser.add_argument("--alpha",       type=float, default=0.1,
@@ -132,51 +111,45 @@ if __name__ == "__main__":
     parser.add_argument("--length_scale",type=float, default=0.1,
                         help="ExpCov: correlation length in [0,1] physical units")
     # covariance comparison params
-    parser.add_argument("--cov_num_pt",  type=int,   default=32,
-                        help="Grid size for covariance comparison (matrix is cov_num_pt^2 x cov_num_pt^2)")
-    parser.add_argument("--n_real",      type=int,   default=500,
-                        help="MC realizations for estimate_cov_full")
+    parser.add_argument("--cov_stride",  type=int,   default=16,
+                        help="Subsample stride for covariance estimation; "
+                             "covariance grid has (num_pt // cov_stride)^2 points")
     args = parser.parse_args()
 
     num_pt      = args.num_pt
     num_mc      = args.num_mc
     num_process = min(num_mc, mp.cpu_count())
+    cov_stride  = args.cov_stride
 
-    # ── build generator and theoretical variogram ──────────────────────────────
+    # ── build generator and theoretical variogram/covariance ──────────────────
     if args.mode == "fbm":
         alpha, c = args.alpha, args.c
         gen = fBmGenerator(c=c, alpha=alpha, num_pt=num_pt,
                            minpadding=args.minpadding)
-        # variogram in grid-point lags: γ(h) = c·h^α  (fBmGenerator rescales by
-        # num_pt^(α/2) so the grid-unit variogram has this exact form)
         def gamma_theory_fn(lags):
             return c * lags ** alpha
         theory_label = (fr"Theoretical: $\gamma(h)={c}\,h^{{{alpha}}}$"
                         fr"  (Hurst $= {alpha/2}$)")
         suptitle = (f"fBm Ensemble Statistics  |  "
                     f"Hurst={alpha/2}, c={c}, size={num_pt}, MC={num_mc}")
-        filename = f"stats_fbm_hurst{alpha/2}_size{num_pt}.pdf"
-        cov_num_pt = args.cov_num_pt
-        small_gen  = fBmGenerator(c=c, alpha=alpha, num_pt=cov_num_pt,
-                                   minpadding=args.minpadding)
+        filename = f"stats_fbm_hurst{alpha/2}_size{num_pt}.png"
         def sigma_theory_fn(pts):
-            return fBs_cov_matrix(H=alpha/2, L=1.0, N=cov_num_pt, c=c)
-
+            diff = pts[:, None, :] - pts[None, :, :]
+            r = np.linalg.norm(diff, axis=2)
+            p_norm2H = np.linalg.norm(pts, axis=1) ** alpha
+            return c * (p_norm2H[:, None] + p_norm2H[None, :] - r ** alpha)
     else:  # exp
         sigma, ell = args.sigma, args.length_scale
         gen = ExpCovGenerator(sigma=sigma, length_scale=ell, num_pt=num_pt,
                               minpadding=args.minpadding)
-        # physical lag for h grid steps = h / num_pt
         def gamma_theory_fn(lags):
             return sigma**2 * (1 - np.exp(-lags / (ell * num_pt)))
-        theory_label = (fr"Theoretical: $\gamma(h)=\sigma^2(1-e^{{-h/\ell}})$"
-                        fr"  $\sigma={sigma}$, $\ell={ell}$")
+        # theory_label = (fr"Theoretical: $\gamma(h)=\sigma^2(1-e^{{-h/\ell}})$"
+        #                 fr"  $\sigma={sigma}$, $\ell={ell}$")
+        theory_label = "Theoretical"
         suptitle = (f"ExpCov Ensemble Statistics  |  "
                     f"σ={sigma}, ℓ={ell}, size={num_pt}, MC={num_mc}")
-        filename = f"stats_exp_sigma{sigma}_l{ell}_size{num_pt}.pdf"
-        cov_num_pt = args.cov_num_pt
-        small_gen  = ExpCovGenerator(sigma=sigma, length_scale=ell, num_pt=cov_num_pt,
-                                     minpadding=args.minpadding)
+        filename = f"stats_exp_sigma{sigma}_l{ell}_size{num_pt}.png"
         def sigma_theory_fn(pts):
             diff = pts[:, None, :] - pts[None, :, :]
             r    = np.linalg.norm(diff, axis=2)
@@ -194,48 +167,55 @@ if __name__ == "__main__":
 
     # ── statistics ─────────────────────────────────────────────────────────────
     mean_field = fields.mean(axis=0)
-    var_field  = fields.var(axis=0, ddof=1)
 
     lags, gamma_iso = empirical_variogram(fields)
     gamma_theory    = gamma_theory_fn(lags)
     lags_normed     = lags / (num_pt - 1)
 
-    # ── covariance comparison ──────────────────────────────────────────────────
-    pts_cov, Sigma_hat = estimate_cov_full(small_gen, n_real=args.n_real)
-    Sigma_th  = sigma_theory_fn(pts_cov)
-    cov_vmin  = min(Sigma_hat.min(), Sigma_th.min())
-    cov_vmax  = max(Sigma_hat.max(), Sigma_th.max())
+    # ── covariance estimation (reuses the same MC fields, subsampled) ───────────
+    pts_cov, Sigma_hat = estimate_cov_from_fields(fields, stride=cov_stride)
+    Sigma_th = sigma_theory_fn(pts_cov)
+
+    # ── errors ────────────────────────────────────────────────────────────────
+    std_field = fields.std(axis=0, ddof=1)
+    rel_err_mean = np.linalg.norm(mean_field) / np.linalg.norm(std_field)
+    rel_err_cov  = np.linalg.norm(Sigma_hat - Sigma_th, 'fro') / np.linalg.norm(Sigma_th, 'fro')
+    rel_err_vario = np.linalg.norm(gamma_iso - gamma_theory) / np.linalg.norm(gamma_theory)
 
     # ── visualization ──────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(12, 12))
-    gs  = gridspec.GridSpec(2, 3, height_ratios=[1, 3])
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax3 = fig.add_subplot(gs[0, 2])
-    ax4 = fig.add_subplot(gs[1, :])
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-    im0 = ax1.imshow(Sigma_hat, cmap='RdBu_r', vmin=cov_vmin, vmax=cov_vmax)
-    ax1.set_title(r"Estimated Cov $\hat{\Sigma}$")
-    fig.colorbar(im0, ax=ax1, fraction=0.046)
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
 
-    im1 = ax2.imshow(mean_field, cmap='viridis')
-    ax2.set_title("Ensemble Mean")
-    fig.colorbar(im1, ax=ax2, fraction=0.046)
+    vmin = min(mean_field.min(), Sigma_hat.min())
+    vmax = max(mean_field.max(), Sigma_hat.max())
 
-    im2 = ax3.imshow(Sigma_th, cmap='RdBu_r', vmin=cov_vmin, vmax=cov_vmax)
-    ax3.set_title(r"Theoretical Cov $\Sigma$")
-    fig.colorbar(im2, ax=ax3, fraction=0.046)
+    im0 = ax1.imshow(mean_field, cmap=cmc.batlowW_r, vmin=vmin, vmax=vmax, origin='lower')
+    ax1.set_title(rf"Ensemble Mean ($\epsilon = {rel_err_mean:.3f}$)")
+    div0 = make_axes_locatable(ax1)
+    fig.colorbar(im0, cax=div0.append_axes("right", size="5%", pad=0.05))
 
-    ax4.loglog(lags_normed, gamma_iso,    'o-',  label="Empirical (isotropic)")
-    ax4.loglog(lags_normed, gamma_theory, 'k--', label=theory_label)
-    ax4.set_xlabel("Normalized lag $h / (N-1)$")
-    ax4.set_ylabel(r"$\hat{\gamma}(h)$")
-    ax4.set_title("Empirical vs Theoretical Variogram")
-    ax4.legend()
-    ax4.grid(True, which="both", ls="--")
+    im1 = ax2.imshow(Sigma_hat, cmap=cmc.batlowW_r, vmin=vmin, vmax=vmax, origin='lower')
+    ax2.set_title(rf"Ensemble Covariance ($\epsilon = {rel_err_cov:.3f}$)")
+    ax2.set_xlabel(r"Spatial location $\mathbf{s}'$")
+    ax2.set_ylabel(r"Spatial location $\mathbf{s}$")
+    div1 = make_axes_locatable(ax2)
+    fig.colorbar(im1, cax=div1.append_axes("right", size="5%", pad=0.05))
+
+    ax3.plot(lags_normed, gamma_iso, color='#444444', linewidth=3, label="Estimated")
+    line, = ax3.plot(lags_normed, gamma_theory, color='#FFFFFF', linewidth=1, linestyle='--', label=theory_label)
+    line.set_path_effects([pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
+    line.set_solid_capstyle("round")
+    line.set_dash_capstyle("round")
+    
+    ax3.set_xlabel("Normalized lag $h / (N-1)$")
+    ax3.set_ylabel(r"$\hat{\gamma}(h)$")
+    ax3.set_title(rf"Ensemble Variogram ($\epsilon = {rel_err_vario:.3f}$)")
+    ax3.legend()
+    ax3.grid(True, which="both", ls="--")
 
     plt.suptitle(suptitle, fontsize=14)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig(filename, format='pdf')
+    plt.savefig(filename, dpi=300)
     print(f"Saved {filename}")
     plt.show()
