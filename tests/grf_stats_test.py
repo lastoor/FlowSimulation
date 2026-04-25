@@ -7,7 +7,8 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
-from matplotlib.gridspec import GridSpec
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.ticker import MultipleLocator
 import cmcrameri.cm as cmc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -280,26 +281,34 @@ if __name__ == "__main__":
     # ── visualization ──────────────────────────────────────────────────────────
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 4))
 
     vmin = min(mean_field.min(), Sigma_hat.min())
     vmax = max(mean_field.max(), Sigma_hat.max())
+    v = max(abs(vmin), abs(vmax))
+    norm = TwoSlopeNorm(vmin=-v, vcenter=0, vmax=v)
 
-    im0 = ax1.imshow(mean_field, cmap=cmc.batlow_r, vmin=vmin, vmax=vmax, origin='lower')
+    im0 = ax1.imshow(mean_field, cmap=cmc.cork, origin='lower', norm=norm)
     ax1.set_title(rf"Ensemble Mean ($\epsilon = {rel_err_mean:.3f}$)")
     ax1.set_xlabel(r"$x / \delta$")
     ax1.set_ylabel(r"$y / \delta$")
+    ax1.xaxis.set_major_locator(MultipleLocator(25))
+    ax1.yaxis.set_major_locator(MultipleLocator(25))
     div0 = make_axes_locatable(ax1)
-    fig.colorbar(im0, cax=div0.append_axes("right", size="5%", pad=0.05))
-    ax1.set_aspect('equal')
+    cbar = fig.colorbar(im0, cax=div0.append_axes("right", size="5%", pad=0.05))
+    cbar.ax.set_ylim(mean_field.min(), mean_field.max())
+    ax1.set_aspect('equal', adjustable="box")
 
-    im1 = ax2.imshow(Sigma_hat, cmap=cmc.batlow_r, vmin=vmin, vmax=vmax, origin='lower')
+    im1 = ax2.imshow(Sigma_hat, cmap=cmc.cork, origin='lower', norm=norm)
     ax2.set_title(rf"Ensemble Covariance ($\epsilon = {rel_err_cov:.3f}$)")
     ax2.set_xlabel(r"$s / \delta$")
     ax2.set_ylabel(r"$s' / \delta$")
+    ax2.xaxis.set_major_locator(MultipleLocator(2500))
+    ax2.yaxis.set_major_locator(MultipleLocator(2500))
     div1 = make_axes_locatable(ax2)
-    fig.colorbar(im1, cax=div1.append_axes("right", size="5%", pad=0.05))
-    ax2.set_aspect('equal')
+    cbar = fig.colorbar(im1, cax=div1.append_axes("right", size="5%", pad=0.05))
+    cbar.ax.set_ylim(Sigma_hat.min(), Sigma_hat.max())
+    ax2.set_aspect('equal', adjustable="box")
 
     ax3.plot(lags, gamma_theory, color='#000000', linewidth=3, linestyle='-', label=theory_label)
     line, = ax3.plot(lags, gamma_iso, color='#FFFFFF', linewidth=1, linestyle=':', label="Numerical")
@@ -311,10 +320,11 @@ if __name__ == "__main__":
 
     ax3.set_xlabel(r"$r / \delta$")
     ax3.set_ylabel(r"$\gamma(r / \delta)$")
+    ax3.xaxis.set_major_locator(MultipleLocator(25))
     ax3.set_title(rf"Ensemble Variogram ($\epsilon = {rel_err_vario:.3f}$)")
     ax3.legend()
     ax3.grid(True, which="both", ls="--")
-    ax3.set_aspect('auto')
+    ax3.set_aspect('auto', adjustable="box")
 
     # plt.suptitle(suptitle, fontsize=14)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
