@@ -47,21 +47,41 @@ def _sample(_i):
 
 # ─── empirical isotropic variogram ─────────────────────────────────────────────
 def empirical_variogram(fields, max_lag=None):
-    """Return (lags, gamma_iso) using all axis directions for isotropy."""
-    num_pt = fields.shape[1]
+    """Return (lags, gamma_iso) using FFT autocorrelation; O(K·N²·logN) vs O(K·N³)."""
+    K, N, _ = fields.shape
     if max_lag is None:
-        max_lag = num_pt - 1
+        max_lag = N - 1
     lags = np.arange(1, max_lag + 1)
-    gamma_iso = np.zeros(len(lags), dtype=float)
-    for idx, h in enumerate(lags):
-        diffs_all = []
-        for d in range(fields.ndim - 1):   # skip ensemble axis 0
-            s1 = [slice(None)] * fields.ndim
-            s2 = [slice(None)] * fields.ndim
-            s1[d + 1] = slice(0, -h)
-            s2[d + 1] = slice(h, None)
-            diffs_all.append((fields[tuple(s1)] - fields[tuple(s2)]).ravel())
-        gamma_iso[idx] = np.var(np.concatenate(diffs_all), ddof=1) / 2
+
+    f_sq     = fields ** 2
+    sq_total = f_sq.sum()
+
+    # ── direction 0 (axis 1) ──────────────────────────────────────────────────
+    # Σ_{k,j,i=0}^{N-h-1} (f[k,i+h,j] - f[k,i,j])²
+    #   = sq_sum_0(h) - 2 * corr_0(h)
+    # sq_sum_0(h) = Σ_{i=h}^{N-1} f²(i) + Σ_{i=0}^{N-h-1} f²(i)  (summed over k,j)
+    # corr_0(h)   = Σ_{k,j,i=0}^{N-h-1} f[k,i,j]*f[k,i+h,j]  ← linear autocorr via FFT
+    sq_cs_0  = np.cumsum(f_sq.sum(axis=(0, 2)))          # (N,)
+    sq_sum_0 = sq_cs_0[N - lags - 1] + sq_total - sq_cs_0[lags - 1]
+    F0 = np.fft.rfft(fields, n=2 * N, axis=1)            # zero-pad → linear autocorr
+    A0 = np.fft.irfft(F0 * F0.conj(), n=2 * N, axis=1)
+    del F0
+    SSQ_0 = sq_sum_0 - 2 * A0[:, lags, :].sum(axis=(0, 2))
+    del A0
+
+    # ── direction 1 (axis 2) ──────────────────────────────────────────────────
+    sq_cs_1  = np.cumsum(f_sq.sum(axis=(0, 1)))          # (N,)
+    sq_sum_1 = sq_cs_1[N - lags - 1] + sq_total - sq_cs_1[lags - 1]
+    F1 = np.fft.rfft(fields, n=2 * N, axis=2)
+    A1 = np.fft.irfft(F1 * F1.conj(), n=2 * N, axis=2)
+    del F1
+    SSQ_1 = sq_sum_1 - 2 * A1[:, :, lags].sum(axis=(0, 1))
+    del A1
+
+    # Matheron estimator: mean squared increment / 2, pooled over both directions
+    n_pairs   = 2 * K * (N - lags) * N
+    gamma_iso = (SSQ_0 + SSQ_1) / (2 * n_pairs)
+
     return lags, gamma_iso
 
 
@@ -159,12 +179,12 @@ if __name__ == "__main__":
         #                 fr"  (Hurst $= {alpha/2}$)")
         suptitle = (f"fBm Ensemble Statistics  |  "
                     f"Hurst={alpha/2}, c={c}, size={num_pt}, MC={num_mc}")
-        filename = f"stats_fbm_hurst{alpha/2}_size{num_pt}.png"
+        filename = f"stats_fbm_c{c}_hurst{alpha/2}_size{num_pt}_mc{num_mc}_stride{cov_stride}.png"
         def sigma_theory_fn(pts):
             diff = pts[:, None, :] - pts[None, :, :]
             r = np.linalg.norm(diff, axis=2)
             p_norm2H = np.linalg.norm(pts, axis=1) ** alpha
-            return c * (p_norm2H[:, None] + p_norm2H[None, :] - r ** alpha)
+            return c * num_pt**alpha * (p_norm2H[:, None] + p_norm2H[None, :] - r ** alpha)
     else:  # exp
         sigma, ell = args.sigma, args.length_scale
         gen = ExpCovGenerator(sigma=sigma, length_scale=ell, num_pt=num_pt,
@@ -176,36 +196,85 @@ if __name__ == "__main__":
         theory_label = "Theoretical"
         suptitle = (f"ExpCov Ensemble Statistics  |  "
                     f"σ={sigma}, ℓ={ell}, size={num_pt}, MC={num_mc}")
-        filename = f"stats_exp_sigma{sigma}_l{ell}_size{num_pt}.png"
+        filename = f"stats_exp_sigma{sigma}_l{ell}_size{num_pt}_mc{num_mc}_stride{cov_stride}.png"
         def sigma_theory_fn(pts):
             diff = pts[:, None, :] - pts[None, :, :]
             r    = np.linalg.norm(diff, axis=2)
             return sigma**2 * np.exp(-r / ell)
 
-    # ── parallel sampling ──────────────────────────────────────────────────────
+    # ── covariance grid (computed once, independent of realizations) ──────────
+    N          = num_pt
+    cov_idx    = np.arange(0, N, cov_stride)
+    cov_coords = cov_idx / N
+    Xg, Yg    = np.meshgrid(cov_coords, cov_coords, indexing='ij')
+    pts_cov    = np.stack([Xg.ravel(), Yg.ravel()], axis=1)  # (M, 2)
+    M          = len(cov_idx) ** 2
+    lags       = np.arange(1, N)
+
+    # ── online accumulators — O(N²) memory, no full ensemble stored ───────────
+    acc_field    = np.zeros((N, N))
+    acc_field_sq = np.zeros((N, N))
+    acc_sq_sum_0 = np.zeros(N - 1)
+    acc_corr_0   = np.zeros(N - 1)
+    acc_sq_sum_1 = np.zeros(N - 1)
+    acc_corr_1   = np.zeros(N - 1)
+    acc_x        = np.zeros(M)
+    acc_outer    = np.zeros((M, M))
+
+    # ── parallel sampling with online accumulation ────────────────────────────
     ctx = get_context("spawn")
     with ctx.Pool(processes=num_process,
                   initializer=init_worker,
                   initargs=(gen,)) as pool:
-        fields_list = pool.map(_sample, range(num_mc))
+        for f_k in pool.imap(_sample, range(num_mc)):
+            acc_field    += f_k
+            acc_field_sq += f_k ** 2
 
-    orig_shape = tuple(len(p) for p in gen.pts)
-    fields = np.stack(fields_list, axis=0).reshape((num_mc, *orig_shape))
+            # variogram: per-realization FFT autocorrelation
+            fk2  = f_k[np.newaxis]          # (1, N, N) — axis-aware rfft
+            f_sq = f_k ** 2
+            sq_t = f_sq.sum()
 
-    # ── statistics ─────────────────────────────────────────────────────────────
-    mean_field = fields.mean(axis=0)
+            sq_cs_0       = np.cumsum(f_sq.sum(axis=1))
+            acc_sq_sum_0 += sq_cs_0[N - lags - 1] + sq_t - sq_cs_0[lags - 1]
+            F0            = np.fft.rfft(fk2, n=2 * N, axis=1)
+            corr_0        = np.fft.irfft(F0 * F0.conj(), n=2 * N, axis=1)[0]
+            acc_corr_0   += np.take(corr_0, lags, axis=0).sum(axis=1)
+            del F0
 
-    lags, gamma_iso = empirical_variogram(fields)
-    gamma_theory    = gamma_theory_fn(lags)
+            sq_cs_1       = np.cumsum(f_sq.sum(axis=0))
+            acc_sq_sum_1 += sq_cs_1[N - lags - 1] + sq_t - sq_cs_1[lags - 1]
+            F1            = np.fft.rfft(fk2, n=2 * N, axis=2)
+            corr_1        = np.fft.irfft(F1 * F1.conj(), n=2 * N, axis=2)[0]
+            acc_corr_1   += np.take(corr_1, lags, axis=1).sum(axis=0)
+            del F1
 
-    # ── covariance estimation (reuses the same MC fields, subsampled) ───────────
-    pts_cov, Sigma_hat = estimate_cov_from_fields(fields, stride=cov_stride)
-    Sigma_th = sigma_theory_fn(pts_cov)
+            # covariance: rank-1 outer-product update
+            x_k        = f_k[::cov_stride, ::cov_stride].ravel()
+            acc_x     += x_k
+            acc_outer += np.outer(x_k, x_k)
+
+            del f_k, fk2, f_sq, x_k
+
+    # ── finalize statistics ───────────────────────────────────────────────────
+    mean_field = acc_field / num_mc
+    std_field  = np.sqrt(np.maximum(
+        (acc_field_sq / num_mc - mean_field ** 2) * num_mc / (num_mc - 1), 0.0
+    ))
+
+    SSQ_0        = acc_sq_sum_0 - 2 * acc_corr_0
+    SSQ_1        = acc_sq_sum_1 - 2 * acc_corr_1
+    n_pairs      = 2 * num_mc * (N - lags) * N
+    gamma_iso    = (SSQ_0 + SSQ_1) / (2 * n_pairs)
+    gamma_theory = gamma_theory_fn(lags)
+
+    mean_x    = acc_x / num_mc
+    Sigma_hat = acc_outer / num_mc - np.outer(mean_x, mean_x)
+    Sigma_th  = sigma_theory_fn(pts_cov)
 
     # ── errors ────────────────────────────────────────────────────────────────
-    std_field = fields.std(axis=0, ddof=1)
-    rel_err_mean = np.linalg.norm(mean_field) / np.linalg.norm(std_field)
-    rel_err_cov  = np.linalg.norm(Sigma_hat - Sigma_th, 'fro') / np.linalg.norm(Sigma_th, 'fro')
+    rel_err_mean  = np.linalg.norm(mean_field) / np.linalg.norm(std_field)
+    rel_err_cov   = np.linalg.norm(Sigma_hat - Sigma_th, 'fro') / np.linalg.norm(Sigma_th, 'fro')
     rel_err_vario = np.linalg.norm(gamma_iso - gamma_theory) / np.linalg.norm(gamma_theory)
 
     # ── visualization ──────────────────────────────────────────────────────────
@@ -216,7 +285,7 @@ if __name__ == "__main__":
     vmin = min(mean_field.min(), Sigma_hat.min())
     vmax = max(mean_field.max(), Sigma_hat.max())
 
-    im0 = ax1.imshow(mean_field, cmap=cmc.batlowW_r, vmin=vmin, vmax=vmax, origin='lower')
+    im0 = ax1.imshow(mean_field, cmap=cmc.batlow_r, vmin=vmin, vmax=vmax, origin='lower')
     ax1.set_title(rf"Ensemble Mean ($\epsilon = {rel_err_mean:.3f}$)")
     ax1.set_xlabel(r"$x / \delta$")
     ax1.set_ylabel(r"$y / \delta$")
@@ -224,8 +293,8 @@ if __name__ == "__main__":
     fig.colorbar(im0, cax=div0.append_axes("right", size="5%", pad=0.05))
     ax1.set_aspect('equal')
 
-    im1 = ax2.imshow(Sigma_hat, cmap=cmc.batlowW_r, vmin=vmin, vmax=vmax, origin='lower')
-    ax2.set_title(rf"Ensemble Covariance $\Sigma(s, s')$ ($\epsilon = {rel_err_cov:.3f}$)")
+    im1 = ax2.imshow(Sigma_hat, cmap=cmc.batlow_r, vmin=vmin, vmax=vmax, origin='lower')
+    ax2.set_title(rf"Ensemble Covariance ($\epsilon = {rel_err_cov:.3f}$)")
     ax2.set_xlabel(r"$s / \delta$")
     ax2.set_ylabel(r"$s' / \delta$")
     div1 = make_axes_locatable(ax2)
