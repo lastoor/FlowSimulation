@@ -7,6 +7,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+from matplotlib.gridspec import GridSpec
 import cmcrameri.cm as cmc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -89,6 +90,29 @@ def estimate_cov_from_fields(fields, stride=1):
 
     return pts, Sigma_hat
 
+def configure_style():
+    import glob
+    import matplotlib.font_manager as fm
+
+    family: str = "CMU Sans Serif"
+    mathtext_fontset: str = "cm"
+    unicode_minus: bool = False
+    cmu_font_glob: list = ["/home1/binhaoli/.local/share/fonts/cmun*.ttf", "/Users/binhaoli/Library/Fonts/cmun*.ttf"]
+
+    for paths in cmu_font_glob:
+        for path in glob.glob(paths):
+            fm.fontManager.addfont(path)
+            
+    plt.rcParams["font.family"] = family
+    plt.rcParams["mathtext.fontset"] = mathtext_fontset
+    plt.rcParams["axes.unicode_minus"] = unicode_minus
+
+    plt.rcParams["font.size"] = 14
+    plt.rcParams["axes.labelsize"] = 16
+    plt.rcParams["axes.titlesize"] = 16
+    plt.rcParams["xtick.labelsize"] = 13
+    plt.rcParams["ytick.labelsize"] = 13
+    plt.rcParams["legend.fontsize"] = 12
 
 # ─── main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -121,6 +145,8 @@ if __name__ == "__main__":
     num_process = min(num_mc, mp.cpu_count())
     cov_stride  = args.cov_stride
 
+    configure_style()
+
     # ── build generator and theoretical variogram/covariance ──────────────────
     if args.mode == "fbm":
         alpha, c = args.alpha, args.c
@@ -128,8 +154,9 @@ if __name__ == "__main__":
                            minpadding=args.minpadding)
         def gamma_theory_fn(lags):
             return c * lags ** alpha
-        theory_label = (fr"Theoretical: $\gamma(h)={c}\,h^{{{alpha}}}$"
-                        fr"  (Hurst $= {alpha/2}$)")
+        theory_label = "Theoretical"
+        # theory_label = (fr"Theoretical: $\gamma(h)={c}\,h^{{{alpha}}}$"
+        #                 fr"  (Hurst $= {alpha/2}$)")
         suptitle = (f"fBm Ensemble Statistics  |  "
                     f"Hurst={alpha/2}, c={c}, size={num_pt}, MC={num_mc}")
         filename = f"stats_fbm_hurst{alpha/2}_size{num_pt}.png"
@@ -191,29 +218,36 @@ if __name__ == "__main__":
 
     im0 = ax1.imshow(mean_field, cmap=cmc.batlowW_r, vmin=vmin, vmax=vmax, origin='lower')
     ax1.set_title(rf"Ensemble Mean ($\epsilon = {rel_err_mean:.3f}$)")
+    ax1.set_xlabel(r"$x / \delta$")
+    ax1.set_ylabel(r"$y / \delta$")
     div0 = make_axes_locatable(ax1)
     fig.colorbar(im0, cax=div0.append_axes("right", size="5%", pad=0.05))
+    ax1.set_aspect('equal')
 
     im1 = ax2.imshow(Sigma_hat, cmap=cmc.batlowW_r, vmin=vmin, vmax=vmax, origin='lower')
-    ax2.set_title(rf"Ensemble Covariance ($\epsilon = {rel_err_cov:.3f}$)")
-    ax2.set_xlabel(r"Spatial location $\mathbf{s}'$")
-    ax2.set_ylabel(r"Spatial location $\mathbf{s}$")
+    ax2.set_title(rf"Ensemble Covariance $\Sigma(s, s')$ ($\epsilon = {rel_err_cov:.3f}$)")
+    ax2.set_xlabel(r"$s / \delta$")
+    ax2.set_ylabel(r"$s' / \delta$")
     div1 = make_axes_locatable(ax2)
     fig.colorbar(im1, cax=div1.append_axes("right", size="5%", pad=0.05))
+    ax2.set_aspect('equal')
 
-    ax3.plot(lags, gamma_iso, color='#444444', linewidth=3, label="Estimated")
-    line, = ax3.plot(lags, gamma_theory, color='#FFFFFF', linewidth=1, linestyle='--', label=theory_label)
-    line.set_path_effects([pe.Stroke(linewidth=3, foreground="black"), pe.Normal()])
+    ax3.plot(lags, gamma_theory, color='#000000', linewidth=3, linestyle='-', label=theory_label)
+    line, = ax3.plot(lags, gamma_iso, color='#FFFFFF', linewidth=1, linestyle=':', label="Numerical")
+    line.set_path_effects([pe.Stroke(linewidth=2, foreground='#444444'), pe.Normal()])
     line.set_solid_capstyle("round")
     line.set_dash_capstyle("round")
+    div2 = make_axes_locatable(ax3)
+    div2.append_axes("right", size="5%", pad=0.05).set_visible(False)
 
-    ax3.set_xlabel("Lag $h$")
-    ax3.set_ylabel(r"$\hat{\gamma}(h)$")
+    ax3.set_xlabel(r"$r / \delta$")
+    ax3.set_ylabel(r"$\gamma(r / \delta)$")
     ax3.set_title(rf"Ensemble Variogram ($\epsilon = {rel_err_vario:.3f}$)")
     ax3.legend()
     ax3.grid(True, which="both", ls="--")
+    ax3.set_aspect('auto')
 
-    plt.suptitle(suptitle, fontsize=14)
+    # plt.suptitle(suptitle, fontsize=14)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(filename, dpi=300)
     print(f"Saved {filename}")
