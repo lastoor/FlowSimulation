@@ -38,6 +38,7 @@ from .utils import (
     summarize_arrivals,
 )
 from .api import particle_tracking_rk45_gpu_summary, particle_tracking_summary
+from .first_arrival import first_arrival_time_grid
 
 try:
     # Numba's CUDA import can fail at import time if a driver isn't present/configured.
@@ -62,6 +63,7 @@ __all__ = [
     "particle_tracking_pollock_gpu_summary",
     "particle_tracking_rk45_gpu_summary",
     "particle_tracking_summary",
+    "first_arrival_time_grid",
     "compute_travel_times",
     "extract_particle_trajectories",
     "fastest_trajectory",

@@ -281,7 +281,7 @@ if __name__ == "__main__":
     # ── visualization ──────────────────────────────────────────────────────────
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 4))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
 
     vmin = min(mean_field.min(), Sigma_hat.min())
     vmax = max(mean_field.max(), Sigma_hat.max())
@@ -309,6 +309,23 @@ if __name__ == "__main__":
     cbar = fig.colorbar(im1, cax=div1.append_axes("right", size="5%", pad=0.05))
     cbar.ax.set_ylim(Sigma_hat.min(), Sigma_hat.max())
     ax2.set_aspect('equal', adjustable="box")
+    
+    # gamma = 2
+    # scaled = np.sign(Sigma_hat) * (np.abs(Sigma_hat) ** gamma)
+    # im1 = ax2.imshow(scaled, cmap=cmc.cork, origin='lower', norm=TwoSlopeNorm(vmin=-v**gamma, vcenter=0, vmax=v**gamma))
+    # ax2.set_title(rf"Ensemble Covariance ($\epsilon = {rel_err_cov:.3f}$)")
+    # ax2.set_xlabel(r"$s / \delta$")
+    # ax2.set_ylabel(r"$s' / \delta$")
+    # ax2.xaxis.set_major_locator(MultipleLocator(2500))
+    # ax2.yaxis.set_major_locator(MultipleLocator(2500))
+    # div1 = make_axes_locatable(ax2)
+    # cbar = fig.colorbar(im1, cax=div1.append_axes("right", size="5%", pad=0.05))
+    # cbar.ax.set_ylim(Sigma_hat.min()*v**gamma, Sigma_hat.max()*v**gamma)
+    # ticks_orig = np.array([-0.02, 0, 0.02, 0.04, 0.06, 0.08, 0.1])
+    # ticks_scaled = np.sign(ticks_orig) * (np.abs(ticks_orig) ** gamma)
+    # cbar.set_ticks(ticks_scaled)
+    # cbar.set_ticklabels([f"{t:.2g}" for t in ticks_orig])
+    # ax2.set_aspect('equal', adjustable="box")
 
     ax3.plot(lags, gamma_theory, color='#000000', linewidth=3, linestyle='-', label=theory_label)
     line, = ax3.plot(lags, gamma_iso, color='#FFFFFF', linewidth=1, linestyle=':', label="Numerical")
@@ -319,7 +336,7 @@ if __name__ == "__main__":
     div2.append_axes("right", size="5%", pad=0.05).set_visible(False)
 
     ax3.set_xlabel(r"$r / \delta$")
-    ax3.set_ylabel(r"$\gamma(r / \delta)$")
+    ax3.set_ylabel(r"$\gamma^H(r / \delta)$")
     ax3.xaxis.set_major_locator(MultipleLocator(25))
     ax3.set_title(rf"Ensemble Variogram ($\epsilon = {rel_err_vario:.3f}$)")
     ax3.legend()

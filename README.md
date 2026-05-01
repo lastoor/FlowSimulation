@@ -116,6 +116,29 @@ Per-MC file:
 - The GPU summary paths for `rk4` and `pollock` use Taichi and are optimized for arrival metrics; trajectory replay is currently limited to selected particles and not the full breakthrough-curve population.
 - The main simulation/runtime flow now consumes the summary result directly instead of tracking everything and then calling a separate fastest-path reduction helper.
 
+## Grid First-Arrival API
+- `simulation.particle_tracking.first_arrival_time_grid(params)` computes a first-arrival-time field with the same shape as `logk_field`.
+- It releases one particle at each cell center, traces backward through the reversed velocity field, and records the time when the path first enters `source_mask`.
+- Cells inside `source_mask` return `0.0`; cells that do not reach the source return `np.inf`.
+- The v1 backend uses Pollock tracking with `backend="gpu"` by default and falls back to CPU unless `fallback_to_cpu=False`.
+- Face-mode inputs use Pollock-native full staggered arrays: `x_faces`, `y_faces`, `vx (ny, nx+1)`, and `vy (ny+1, nx)`.
+- Cell-mode inputs accept `x`, `y`, and cell-centered `vx`/`vy` shaped like `logk_field`; they are converted to full face fields internally.
+
+Example:
+```python
+result = particle_tracking.first_arrival_time_grid({
+    "logk_field": logk_field,
+    "source_mask": source_mask,
+    "x_faces": x_faces,
+    "y_faces": y_faces,
+    "vx": vx_face,
+    "vy": vy_face,
+    "velocity_location": "face",
+    "backend": "gpu",
+})
+arrival_time = result["arrival_time"]
+```
+
 ## Velocity Field Location Convention
 - `velocity_location="cell"`: `vx`/`vy` are treated as cell-centered and interpolated bilinearly.
 - `velocity_location="face"`: `vx`/`vy` are treated with coordinate-wise face interpolation (`vx` along x-faces, `vy` along y-faces), consistent with `simulation/particle_tracking/rk4_fp.py`.

@@ -983,6 +983,116 @@ class TestParticleTracking(unittest.TestCase):
         self.assertEqual(result["fastest"]["particle_id"], 1)
         self.assertAlmostEqual(result["fastest"]["x"][-1], x_faces[-1], places=6)
 
+    def test_first_arrival_time_grid_face_uniform_flow(self):
+        logk = np.zeros((2, 3), dtype=np.float32)
+        source_mask = np.zeros_like(logk, dtype=bool)
+        source_mask[:, 0] = True
+        x_faces = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        y_faces = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        vx = np.ones((2, 4), dtype=np.float32)
+        vy = np.zeros((3, 3), dtype=np.float32)
+
+        result = particle_tracking.first_arrival_time_grid(
+            {
+                "backend": "cpu",
+                "logk_field": logk,
+                "source_mask": source_mask,
+                "velocity_location": "face",
+                "x_faces": x_faces,
+                "y_faces": y_faces,
+                "vx": vx,
+                "vy": vy,
+                "max_steps": 16,
+            }
+        )
+
+        expected = np.array([[0.0, 0.5, 1.5], [0.0, 0.5, 1.5]], dtype=np.float32)
+        np.testing.assert_allclose(result["arrival_time"], expected, rtol=0.0, atol=2e-5)
+        self.assertEqual(result["arrival_time"].shape, logk.shape)
+        self.assertEqual(result["status"].shape, logk.shape)
+
+    def test_first_arrival_time_grid_cell_matches_face_uniform_flow(self):
+        logk = np.zeros((2, 3), dtype=np.float32)
+        source_mask = np.zeros_like(logk, dtype=bool)
+        source_mask[:, 0] = True
+        x = np.array([0.5, 1.5, 2.5], dtype=np.float32)
+        y = np.array([0.5, 1.5], dtype=np.float32)
+
+        cell_result = particle_tracking.first_arrival_time_grid(
+            {
+                "backend": "cpu",
+                "logk_field": logk,
+                "source_mask": source_mask,
+                "velocity_location": "cell",
+                "x": x,
+                "y": y,
+                "vx": np.ones_like(logk, dtype=np.float32),
+                "vy": np.zeros_like(logk, dtype=np.float32),
+                "max_steps": 16,
+            }
+        )
+        face_result = particle_tracking.first_arrival_time_grid(
+            {
+                "backend": "cpu",
+                "logk_field": logk,
+                "source_mask": source_mask,
+                "velocity_location": "face",
+                "x_faces": np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32),
+                "y_faces": np.array([0.0, 1.0, 2.0], dtype=np.float32),
+                "vx": np.ones((2, 4), dtype=np.float32),
+                "vy": np.zeros((3, 3), dtype=np.float32),
+                "max_steps": 16,
+            }
+        )
+
+        np.testing.assert_allclose(cell_result["arrival_time"], face_result["arrival_time"], rtol=0.0, atol=2e-5)
+
+    def test_first_arrival_time_grid_zero_velocity_unreachable(self):
+        logk = np.zeros((1, 2), dtype=np.float32)
+        source_mask = np.array([[True, False]])
+
+        result = particle_tracking.first_arrival_time_grid(
+            {
+                "backend": "cpu",
+                "logk_field": logk,
+                "source_mask": source_mask,
+                "velocity_location": "face",
+                "x_faces": np.array([0.0, 1.0, 2.0], dtype=np.float32),
+                "y_faces": np.array([0.0, 1.0], dtype=np.float32),
+                "vx": np.zeros((1, 3), dtype=np.float32),
+                "vy": np.zeros((2, 2), dtype=np.float32),
+                "max_steps": 4,
+            }
+        )
+
+        self.assertEqual(result["arrival_time"][0, 0], 0.0)
+        self.assertTrue(np.isinf(result["arrival_time"][0, 1]))
+
+    def test_first_arrival_time_grid_gpu_matches_cpu_when_available(self):
+        logk = np.zeros((2, 3), dtype=np.float32)
+        source_mask = np.zeros_like(logk, dtype=bool)
+        source_mask[:, 0] = True
+        params = {
+            "logk_field": logk,
+            "source_mask": source_mask,
+            "velocity_location": "face",
+            "x_faces": np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32),
+            "y_faces": np.array([0.0, 1.0, 2.0], dtype=np.float32),
+            "vx": np.ones((2, 4), dtype=np.float32),
+            "vy": np.zeros((3, 3), dtype=np.float32),
+            "max_steps": 16,
+        }
+
+        cpu_result = particle_tracking.first_arrival_time_grid({**params, "backend": "cpu"})
+        try:
+            gpu_result = particle_tracking.first_arrival_time_grid(
+                {**params, "backend": "gpu", "fallback_to_cpu": False}
+            )
+        except Exception as exc:
+            self.skipTest(f"Taichi GPU first-arrival backend unavailable: {exc}")
+
+        np.testing.assert_allclose(gpu_result["arrival_time"], cpu_result["arrival_time"], rtol=0.0, atol=2e-5)
+
 
 if __name__ == '__main__':
     unittest.main()

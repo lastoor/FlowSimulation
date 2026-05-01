@@ -8,6 +8,7 @@ from .pollock_core import (
     POLLOCK_NUDGE_REL,
     STATUS_MAX_STEPS,
     STATUS_OUT_OF_BOUNDS,
+    STATUS_SOURCE_INITIAL,
     STATUS_STAGNATION,
     STATUS_SUCCESS,
     parse_pollock_inputs,
@@ -356,6 +357,102 @@ def _track_trajectories_parallel(seeds_x, seeds_y, x_faces, y_faces, vx, vy, rig
         status[i] = st
 
     return paths_x, paths_y, paths_t, lengths, status
+
+
+@njit
+def _source_neighbor_from_hit(i, j, hit_axis, hit_index, hit_direction):
+    source_i = i
+    source_j = j
+    if hit_axis == 0:
+        source_j = hit_index if hit_direction > 0 else hit_index - 1
+    elif hit_axis == 1:
+        source_i = hit_index if hit_direction > 0 else hit_index - 1
+    return source_i, source_j
+
+
+@njit(parallel=True)
+def _track_source_arrivals_parallel(seeds_x, seeds_y, x_faces, y_faces, vx, vy, source_mask, max_steps):
+    n_particles = seeds_x.size
+    travel_times = np.full(n_particles, np.inf, dtype=np.float32)
+    status = np.zeros(n_particles, dtype=np.int32)
+
+    for p in prange(n_particles):
+        curr_x = seeds_x[p]
+        curr_y = seeds_y[p]
+        curr_t = 0.0
+        st = STATUS_MAX_STEPS
+
+        j = find_cell_index(x_faces, curr_x)
+        i = find_cell_index(y_faces, curr_y)
+        if i == -1 or j == -1:
+            status[p] = STATUS_OUT_OF_BOUNDS
+            continue
+        if source_mask[i, j] != 0:
+            travel_times[p] = 0.0
+            status[p] = STATUS_SOURCE_INITIAL
+            continue
+
+        for _ in range(max_steps):
+            prev_i = find_cell_index(y_faces, curr_y)
+            prev_j = find_cell_index(x_faces, curr_x)
+            if prev_i == -1 or prev_j == -1:
+                st = STATUS_OUT_OF_BOUNDS
+                break
+
+            next_x, next_y, dt, step_status, hit_axis, hit_index, hit_direction = _pollock_step_with_hitinfo(
+                curr_x, curr_y, x_faces, y_faces, vx, vy, x_faces[-1]
+            )
+            if step_status != STATUS_SUCCESS:
+                st = step_status
+                break
+
+            curr_t += dt
+            curr_x = next_x
+            curr_y = next_y
+
+            source_i, source_j = _source_neighbor_from_hit(prev_i, prev_j, hit_axis, hit_index, hit_direction)
+            if 0 <= source_i < source_mask.shape[0] and 0 <= source_j < source_mask.shape[1]:
+                if source_mask[source_i, source_j] != 0:
+                    travel_times[p] = curr_t
+                    st = STATUS_SUCCESS
+                    break
+            else:
+                st = STATUS_OUT_OF_BOUNDS
+                break
+
+            if curr_x <= x_faces[0] or curr_x >= x_faces[-1] or curr_y <= y_faces[0] or curr_y >= y_faces[-1]:
+                st = STATUS_OUT_OF_BOUNDS
+                break
+
+            curr_x, curr_y = _nudge_to_next_cell(curr_x, curr_y, x_faces, y_faces, hit_axis, hit_index, hit_direction)
+        else:
+            st = STATUS_MAX_STEPS
+
+        status[p] = st
+
+    return travel_times, status
+
+
+def pollock_source_arrival_times_cpu(x_faces, y_faces, vx, vy, seeds_x, seeds_y, source_mask, max_steps):
+    """Trace particles until they enter source_mask cells using Pollock stepping."""
+    x_faces = np.asarray(x_faces, dtype=np.float32).ravel()
+    y_faces = np.asarray(y_faces, dtype=np.float32).ravel()
+    vx = np.asarray(vx, dtype=np.float32)
+    vy = np.asarray(vy, dtype=np.float32)
+    seeds_x = np.asarray(seeds_x, dtype=np.float32).ravel()
+    seeds_y = np.asarray(seeds_y, dtype=np.float32).ravel()
+    source_mask = np.asarray(source_mask, dtype=np.int32)
+    if source_mask.shape != (y_faces.size - 1, x_faces.size - 1):
+        raise ValueError("source_mask shape must be (len(y_faces)-1, len(x_faces)-1).")
+    if vx.shape != (y_faces.size - 1, x_faces.size):
+        raise ValueError("vx shape must be (len(y_faces)-1, len(x_faces)).")
+    if vy.shape != (y_faces.size, x_faces.size - 1):
+        raise ValueError("vy shape must be (len(y_faces), len(x_faces)-1).")
+    if seeds_x.shape != seeds_y.shape:
+        raise ValueError("seeds_x and seeds_y must have the same length.")
+    return _track_source_arrivals_parallel(
+        seeds_x, seeds_y, x_faces, y_faces, vx, vy, source_mask, int(max_steps)
+    )
 
 
 def particle_tracking_pollock(params):

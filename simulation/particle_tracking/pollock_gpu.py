@@ -11,6 +11,7 @@ from .pollock_core import (
     POLLOCK_NUDGE_REL,
     STATUS_MAX_STEPS,
     STATUS_OUT_OF_BOUNDS,
+    STATUS_SOURCE_INITIAL,
     STATUS_STAGNATION,
     STATUS_SUCCESS,
     parse_pollock_inputs,
@@ -23,6 +24,7 @@ from .utils import build_fastest_result_from_trajectory, fastest_particle_id, su
 _ti_initialized = False
 _ti_arch = None
 _tracker_cls = None
+_source_tracker_cls = None
 
 
 def _ensure_ti_init():
@@ -385,6 +387,310 @@ def _make_pollock_tracker():
 
     _tracker_cls = PollockTracking2D
     return _tracker_cls
+
+
+def _make_source_tracker():
+    global _source_tracker_cls
+    if _source_tracker_cls is not None:
+        return _source_tracker_cls
+    import taichi as ti
+
+    @ti.data_oriented
+    class PollockSourceArrival2D:
+        def __init__(self, x_faces, y_faces, vx_faces, vy_faces, seeds_x, seeds_y, source_mask, max_steps):
+            x_faces = np.asarray(x_faces, dtype=np.float32).ravel()
+            y_faces = np.asarray(y_faces, dtype=np.float32).ravel()
+            vx_faces = np.asarray(vx_faces, dtype=np.float32)
+            vy_faces = np.asarray(vy_faces, dtype=np.float32)
+            seeds_x = np.asarray(seeds_x, dtype=np.float32).ravel()
+            seeds_y = np.asarray(seeds_y, dtype=np.float32).ravel()
+            source_mask = np.asarray(source_mask, dtype=np.int32)
+            if seeds_x.size != seeds_y.size:
+                raise ValueError("seeds_x and seeds_y must have the same length.")
+            if source_mask.shape != (y_faces.size - 1, x_faces.size - 1):
+                raise ValueError("source_mask shape must be (len(y_faces)-1, len(x_faces)-1).")
+
+            self.nx = x_faces.size - 1
+            self.ny = y_faces.size - 1
+            self.n_particles = seeds_x.size
+            self.max_steps = int(max_steps)
+
+            self.x_faces = ti.field(dtype=ti.f32, shape=x_faces.size)
+            self.y_faces = ti.field(dtype=ti.f32, shape=y_faces.size)
+            self.vx_faces = ti.field(dtype=ti.f32, shape=vx_faces.shape)
+            self.vy_faces = ti.field(dtype=ti.f32, shape=vy_faces.shape)
+            self.source_mask = ti.field(dtype=ti.i32, shape=source_mask.shape)
+            self.x_faces.from_numpy(x_faces)
+            self.y_faces.from_numpy(y_faces)
+            self.vx_faces.from_numpy(vx_faces)
+            self.vy_faces.from_numpy(vy_faces)
+            self.source_mask.from_numpy(source_mask)
+
+            self.seed_x = ti.field(dtype=ti.f32, shape=self.n_particles)
+            self.seed_y = ti.field(dtype=ti.f32, shape=self.n_particles)
+            self.pos_x = ti.field(dtype=ti.f32, shape=self.n_particles)
+            self.pos_y = ti.field(dtype=ti.f32, shape=self.n_particles)
+            self.elapsed = ti.field(dtype=ti.f32, shape=self.n_particles)
+            self.final_times = ti.field(dtype=ti.f32, shape=self.n_particles)
+            self.status = ti.field(dtype=ti.i32, shape=self.n_particles)
+            self.active = ti.field(dtype=ti.i32, shape=self.n_particles)
+            self.seed_x.from_numpy(seeds_x)
+            self.seed_y.from_numpy(seeds_y)
+
+        @ti.func
+        def _find_cell_index(self, grid, n, val):
+            idx = -1
+            if val >= grid[0] and val <= grid[n - 1]:
+                if val == grid[n - 1]:
+                    idx = n - 2
+                else:
+                    low = 0
+                    high = n - 1
+                    while high - low > 1:
+                        mid = (low + high) // 2
+                        if val >= grid[mid]:
+                            low = mid
+                        else:
+                            high = mid
+                    idx = low
+            return idx
+
+        @ti.func
+        def _local_nudge(self, span, coord):
+            scale = ti.abs(span) * POLLOCK_NUDGE_REL
+            floor = ti.max(ti.abs(coord), 1.0) * POLLOCK_NUDGE_F32
+            return ti.max(scale, floor)
+
+        @ti.func
+        def _nudge_to_next_cell(self, curr_x, curr_y, hit_axis, hit_index, hit_direction):
+            if hit_axis == 0:
+                if 0 < hit_index < self.x_faces.shape[0] - 1:
+                    span = ti.select(
+                        hit_direction > 0,
+                        self.x_faces[hit_index] - self.x_faces[hit_index - 1],
+                        self.x_faces[hit_index + 1] - self.x_faces[hit_index],
+                    )
+                    curr_x += ti.cast(hit_direction, ti.f32) * self._local_nudge(span, curr_x)
+            elif hit_axis == 1:
+                if 0 < hit_index < self.y_faces.shape[0] - 1:
+                    span = ti.select(
+                        hit_direction > 0,
+                        self.y_faces[hit_index] - self.y_faces[hit_index - 1],
+                        self.y_faces[hit_index + 1] - self.y_faces[hit_index],
+                    )
+                    curr_y += ti.cast(hit_direction, ti.f32) * self._local_nudge(span, curr_y)
+            return curr_x, curr_y
+
+        @ti.func
+        def _pollock_step(self, x, y):
+            x_new = x
+            y_new = y
+            dt_exit = 0.0
+            status = STATUS_SUCCESS
+            hit_axis = -1
+            hit_index = -1
+            hit_direction = 0
+
+            j = self._find_cell_index(self.x_faces, self.x_faces.shape[0], x)
+            i = self._find_cell_index(self.y_faces, self.y_faces.shape[0], y)
+            if i == -1 or j == -1:
+                status = STATUS_OUT_OF_BOUNDS
+
+            x1 = 0.0
+            x2 = 0.0
+            y1 = 0.0
+            y2 = 0.0
+            dx = 0.0
+            dy = 0.0
+            if status == STATUS_SUCCESS:
+                x1 = self.x_faces[j]
+                x2 = self.x_faces[j + 1]
+                y1 = self.y_faces[i]
+                y2 = self.y_faces[i + 1]
+                dx = x2 - x1
+                dy = y2 - y1
+                if dx <= 0.0 or dy <= 0.0:
+                    status = STATUS_STAGNATION
+
+            if status == STATUS_SUCCESS:
+                v1x = self.vx_faces[i, j]
+                v2x = self.vx_faces[i, j + 1]
+                v1y = self.vy_faces[i, j]
+                v2y = self.vy_faces[i + 1, j]
+
+                ax = (v2x - v1x) / dx
+                ay = (v2y - v1y) / dy
+                vpx = v1x + ax * (x - x1)
+                vpy = v1y + ay * (y - y1)
+
+                dtx = POLLOCK_HUGE_DT
+                if vpx > POLLOCK_EPS and v2x > POLLOCK_EPS:
+                    if ti.abs(ax) > POLLOCK_EPS:
+                        dtx = ti.log(v2x / vpx) / ax
+                    else:
+                        dtx = (x2 - x) / vpx
+                elif vpx < -POLLOCK_EPS and v1x < -POLLOCK_EPS:
+                    if ti.abs(ax) > POLLOCK_EPS:
+                        dtx = ti.log(v1x / vpx) / ax
+                    else:
+                        dtx = (x1 - x) / vpx
+
+                dty = POLLOCK_HUGE_DT
+                if vpy > POLLOCK_EPS and v2y > POLLOCK_EPS:
+                    if ti.abs(ay) > POLLOCK_EPS:
+                        dty = ti.log(v2y / vpy) / ay
+                    else:
+                        dty = (y2 - y) / vpy
+                elif vpy < -POLLOCK_EPS and v1y < -POLLOCK_EPS:
+                    if ti.abs(ay) > POLLOCK_EPS:
+                        dty = ti.log(v1y / vpy) / ay
+                    else:
+                        dty = (y1 - y) / vpy
+
+                dt_exit = ti.min(dtx, dty)
+                if dt_exit == POLLOCK_HUGE_DT or dt_exit <= POLLOCK_EPS or ti.math.isnan(dt_exit):
+                    status = STATUS_STAGNATION
+
+                if status == STATUS_SUCCESS:
+                    x_new = x + vpx * dt_exit
+                    y_new = y + vpy * dt_exit
+                    if ti.abs(ax) > POLLOCK_EPS:
+                        x_new = x1 + (vpx * ti.exp(ax * dt_exit) - v1x) / ax
+                    if ti.abs(ay) > POLLOCK_EPS:
+                        y_new = y1 + (vpy * ti.exp(ay * dt_exit) - v1y) / ay
+
+                    if dtx < dty:
+                        if vpx > 0.0:
+                            x_new = x2
+                            hit_index = j + 1
+                            hit_direction = 1
+                        else:
+                            x_new = x1
+                            hit_index = j
+                            hit_direction = -1
+                        hit_axis = 0
+                    else:
+                        if vpy > 0.0:
+                            y_new = y2
+                            hit_index = i + 1
+                            hit_direction = 1
+                        else:
+                            y_new = y1
+                            hit_index = i
+                            hit_direction = -1
+                        hit_axis = 1
+
+            return x_new, y_new, dt_exit, status, hit_axis, hit_index, hit_direction
+
+        @ti.func
+        def _source_neighbor(self, i, j, hit_axis, hit_index, hit_direction):
+            source_i = i
+            source_j = j
+            if hit_axis == 0:
+                source_j = ti.select(hit_direction > 0, hit_index, hit_index - 1)
+            elif hit_axis == 1:
+                source_i = ti.select(hit_direction > 0, hit_index, hit_index - 1)
+            return source_i, source_j
+
+        @ti.kernel
+        def init_state(self):
+            for p in range(self.n_particles):
+                self.pos_x[p] = self.seed_x[p]
+                self.pos_y[p] = self.seed_y[p]
+                self.elapsed[p] = 0.0
+                self.final_times[p] = POLLOCK_HUGE_DT
+                self.status[p] = STATUS_MAX_STEPS
+                self.active[p] = 1
+                j = self._find_cell_index(self.x_faces, self.x_faces.shape[0], self.pos_x[p])
+                i = self._find_cell_index(self.y_faces, self.y_faces.shape[0], self.pos_y[p])
+                if i == -1 or j == -1:
+                    self.status[p] = STATUS_OUT_OF_BOUNDS
+                    self.active[p] = 0
+                elif self.source_mask[i, j] != 0:
+                    self.final_times[p] = 0.0
+                    self.status[p] = STATUS_SOURCE_INITIAL
+                    self.active[p] = 0
+
+        @ti.kernel
+        def track_all(self):
+            for p in range(self.n_particles):
+                steps = 0
+                while self.active[p] == 1 and steps < self.max_steps:
+                    prev_x = self.pos_x[p]
+                    prev_y = self.pos_y[p]
+                    prev_t = self.elapsed[p]
+                    prev_j = self._find_cell_index(self.x_faces, self.x_faces.shape[0], prev_x)
+                    prev_i = self._find_cell_index(self.y_faces, self.y_faces.shape[0], prev_y)
+                    if prev_i == -1 or prev_j == -1:
+                        self.status[p] = STATUS_OUT_OF_BOUNDS
+                        self.final_times[p] = prev_t
+                        self.active[p] = 0
+                    else:
+                        next_x, next_y, dt, step_status, hit_axis, hit_index, hit_direction = self._pollock_step(prev_x, prev_y)
+                        if step_status != STATUS_SUCCESS:
+                            self.status[p] = step_status
+                            self.final_times[p] = prev_t
+                            self.active[p] = 0
+                        else:
+                            curr_t = prev_t + dt
+                            curr_x = next_x
+                            curr_y = next_y
+                            source_i, source_j = self._source_neighbor(prev_i, prev_j, hit_axis, hit_index, hit_direction)
+                            if source_i >= 0 and source_i < self.ny and source_j >= 0 and source_j < self.nx:
+                                if self.source_mask[source_i, source_j] != 0:
+                                    self.status[p] = STATUS_SUCCESS
+                                    self.final_times[p] = curr_t
+                                    self.active[p] = 0
+                                else:
+                                    if (
+                                        curr_x <= self.x_faces[0]
+                                        or curr_x >= self.x_faces[self.x_faces.shape[0] - 1]
+                                        or curr_y <= self.y_faces[0]
+                                        or curr_y >= self.y_faces[self.y_faces.shape[0] - 1]
+                                    ):
+                                        self.status[p] = STATUS_OUT_OF_BOUNDS
+                                        self.final_times[p] = curr_t
+                                        self.active[p] = 0
+                                    else:
+                                        nudged_x, nudged_y = self._nudge_to_next_cell(curr_x, curr_y, hit_axis, hit_index, hit_direction)
+                                        self.pos_x[p] = nudged_x
+                                        self.pos_y[p] = nudged_y
+                                        self.elapsed[p] = curr_t
+                            else:
+                                self.status[p] = STATUS_OUT_OF_BOUNDS
+                                self.final_times[p] = curr_t
+                                self.active[p] = 0
+                    steps += 1
+
+                if self.active[p] == 1:
+                    self.status[p] = STATUS_MAX_STEPS
+                    self.final_times[p] = self.elapsed[p]
+                    self.active[p] = 0
+
+        def run(self):
+            self.init_state()
+            self.track_all()
+            import taichi as ti
+
+            ti.sync()
+            return self.final_times.to_numpy(), self.status.to_numpy()
+
+    _source_tracker_cls = PollockSourceArrival2D
+    return _source_tracker_cls
+
+
+def pollock_source_arrival_times_gpu(x_faces, y_faces, vx, vy, seeds_x, seeds_y, source_mask, max_steps):
+    """Trace source-arrival particles with the Taichi Pollock backend."""
+    taichi_arch = _ensure_ti_init()
+    Tracker = _make_source_tracker()
+    tracker = Tracker(x_faces, y_faces, vx, vy, seeds_x, seeds_y, source_mask, max_steps)
+    raw_times, status = tracker.run()
+    travel_times = np.where(
+        (status == STATUS_SUCCESS) | (status == STATUS_SOURCE_INITIAL),
+        raw_times,
+        np.inf,
+    ).astype(np.float32)
+    return travel_times, status, taichi_arch
 
 
 def _resolve_snapshot_times(snapshot_mode, raw_snapshot_times, travel_times):
