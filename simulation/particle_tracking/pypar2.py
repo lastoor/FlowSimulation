@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 
 import numpy as np
 
@@ -49,6 +49,11 @@ class Par2Inputs:
     trajectory_memory_limit: int
     taichi_arch: str
     velocity_floor: np.float32
+    replay_top_k: int
+    replay_particles_per_center: int
+    replay_radius_cells: float
+    replay_tolerance: float
+    replay_max_redos: int
 
 
 def require_uniform_faces(faces: np.ndarray, name: str) -> np.float32:
@@ -397,6 +402,22 @@ def parse_par2_inputs(params: dict) -> Par2Inputs:
     if velocity_floor < 0:
         raise ValueError("velocity_floor must be nonnegative.")
 
+    replay_top_k = int(params.get("replay_top_k", 5))
+    replay_particles_per_center = int(params.get("replay_particles_per_center", 40))
+    replay_radius_cells = float(params.get("replay_radius_cells", 0.5))
+    replay_tolerance = float(params.get("replay_tolerance", 1.05))
+    replay_max_redos = int(params.get("replay_max_redos", 3))
+    if replay_top_k < 1:
+        raise ValueError("replay_top_k must be at least 1.")
+    if replay_particles_per_center < 1:
+        raise ValueError("replay_particles_per_center must be at least 1.")
+    if replay_radius_cells < 0.0:
+        raise ValueError("replay_radius_cells must be nonnegative.")
+    if replay_tolerance < 1.0:
+        raise ValueError("replay_tolerance must be >= 1.0.")
+    if replay_max_redos < 0:
+        raise ValueError("replay_max_redos must be nonnegative.")
+
     return Par2Inputs(
         x_faces=x_faces,
         y_faces=y_faces,
@@ -425,6 +446,11 @@ def parse_par2_inputs(params: dict) -> Par2Inputs:
         trajectory_memory_limit=int(params.get("trajectory_memory_limit", 2_000_000)),
         taichi_arch=taichi_arch,
         velocity_floor=velocity_floor,
+        replay_top_k=replay_top_k,
+        replay_particles_per_center=replay_particles_per_center,
+        replay_radius_cells=replay_radius_cells,
+        replay_tolerance=replay_tolerance,
+        replay_max_redos=replay_max_redos,
     )
 
 _ti_initialized = False
@@ -1071,9 +1097,138 @@ def _run_once(cfg: Par2Inputs, snapshot_times=None, force_trajectories=False):
     return tracker.run(), taichi_arch, store_trajectories
 
 
+def _sample_replay_seeds(centers, radius, x_min, x_max, y_min, y_max, right_x, dx, dy,
+                          particles_per_center, rng):
+    """Sample disk-distributed seeds around each release point.
+
+    Falls back to exact-center repetition when ``radius`` is ~0.
+
+    Clamps to the interior so all seeds land strictly inside the domain and
+    strictly left of ``right_x`` (otherwise they would be flagged as
+    SOURCE_INITIAL/SUCCESS and contribute nothing).
+    """
+    centers = np.asarray(centers, dtype=np.float32)
+    k = centers.shape[0]
+    total = k * particles_per_center
+    seeds_x = np.empty(total, dtype=np.float32)
+    seeds_y = np.empty(total, dtype=np.float32)
+
+    eps_x = 0.5 * float(dx)
+    eps_y = 0.5 * float(dy)
+    x_lo = float(x_min) + eps_x
+    x_hi = min(float(x_max) - eps_x, float(right_x) - eps_x)
+    y_lo = float(y_min) + eps_y
+    y_hi = float(y_max) - eps_y
+    if x_hi <= x_lo:
+        x_lo = float(x_min) + 1.0e-3 * float(dx)
+        x_hi = float(right_x) - 1.0e-3 * float(dx)
+    if y_hi <= y_lo:
+        y_lo = float(y_min) + 1.0e-3 * float(dy)
+        y_hi = float(y_max) - 1.0e-3 * float(dy)
+
+    if radius <= 0.0:
+        for i in range(k):
+            cx = float(np.clip(centers[i, 0], x_lo, x_hi))
+            cy = float(np.clip(centers[i, 1], y_lo, y_hi))
+            seeds_x[i * particles_per_center:(i + 1) * particles_per_center] = cx
+            seeds_y[i * particles_per_center:(i + 1) * particles_per_center] = cy
+        return seeds_x, seeds_y
+
+    for i in range(k):
+        cx = float(centers[i, 0])
+        cy = float(centers[i, 1])
+        u = rng.random(particles_per_center, dtype=np.float32)
+        theta = rng.random(particles_per_center, dtype=np.float32) * np.float32(2.0 * math.pi)
+        r = np.float32(radius) * np.sqrt(u)
+        sx = cx + r * np.cos(theta)
+        sy = cy + r * np.sin(theta)
+        np.clip(sx, x_lo, x_hi, out=sx)
+        np.clip(sy, y_lo, y_hi, out=sy)
+        seeds_x[i * particles_per_center:(i + 1) * particles_per_center] = sx
+        seeds_y[i * particles_per_center:(i + 1) * particles_per_center] = sy
+    return seeds_x, seeds_y
+
+
+def _run_replay_attempt(cfg: Par2Inputs, centers, attempt_idx):
+    """One replay attempt: small ensemble around top-K release points.
+
+    Returns a dict with keys ``{"n_arrived","t_best","x","y","t_arr"}``. When
+    no particle arrived, ``t_best`` is ``None`` and the trajectory arrays are
+    ``None``.
+    """
+    k = int(centers.shape[0])
+    m = int(cfg.replay_particles_per_center)
+    seed_offset_big = (int(attempt_idx) * 0x9E3779B1) & 0xFFFFFFFF
+    rng = np.random.default_rng((int(cfg.seed) + int(attempt_idx) * 0x9E3779B1) & 0xFFFFFFFFFFFFFFFF)
+    radius = float(cfg.replay_radius_cells) * float(cfg.dx)
+
+    seeds_x, seeds_y = _sample_replay_seeds(
+        centers, radius,
+        x_min=float(cfg.x_faces[0]),
+        x_max=float(cfg.x_faces[-1]),
+        y_min=float(cfg.y_faces[0]),
+        y_max=float(cfg.y_faces[-1]),
+        right_x=float(cfg.right_x),
+        dx=float(cfg.dx),
+        dy=float(cfg.dy),
+        particles_per_center=m,
+        rng=rng,
+    )
+
+    replay_cfg = dataclass_replace(
+        cfg,
+        seeds_x=seeds_x.astype(np.float32),
+        seeds_y=seeds_y.astype(np.float32),
+        seed=int((int(cfg.seed) + seed_offset_big) & 0xFFFFFFFF),
+        stop_mode="first",
+        return_fastest=True,
+        save_trajectories=True,
+    )
+
+    result, _arch, traj_enabled = _run_once(
+        replay_cfg, snapshot_times=None, force_trajectories=True
+    )
+    status = result["status"].astype(np.int32)
+    raw_times = result["raw_times"].astype(np.float32)
+    travel_times = _successful_times(raw_times, status)
+    arrived = np.isfinite(travel_times)
+    n_arrived = int(np.count_nonzero(arrived))
+    if n_arrived == 0:
+        return {"n_arrived": 0, "t_best": None, "x": None, "y": None, "t_arr": None}
+    fastest_id = int(np.nanargmin(travel_times))
+    t_best = float(travel_times[fastest_id])
+    if traj_enabled and result["traj_x"] is not None:
+        valid = np.isfinite(result["traj_t"][fastest_id])
+        x = result["traj_x"][fastest_id, valid].astype(np.float32).copy()
+        y = result["traj_y"][fastest_id, valid].astype(np.float32).copy()
+        t_arr = result["traj_t"][fastest_id, valid].astype(np.float32).copy()
+    else:
+        x = np.asarray([result["final_x"][fastest_id]], dtype=np.float32)
+        y = np.asarray([result["final_y"][fastest_id]], dtype=np.float32)
+        t_arr = np.asarray([t_best], dtype=np.float32)
+    return {"n_arrived": n_arrived, "t_best": t_best, "x": x, "y": y, "t_arr": t_arr}
+
+
 def particle_tracking_par2_gpu_summary(params):
-    """Run 2D PAR2-style RWPT and return a reference-shaped summary dict."""
+    """Run 2D PAR2-style RWPT with a pilot-then-replay strategy.
+
+    Pass 1 ("pilot") tracks all N particles without storing trajectories
+    (cheap, O(N) Taichi fields). The K fastest pilot particles' release points
+    are used as centers for pass 2, which spawns small particle clouds around
+    each center *with* trajectory storage and finds a confirmed fastest path.
+    Pass 2 is retried (with reshuffled RNG) up to ``replay_max_redos`` times
+    until its fastest travel time falls within ``replay_tolerance * t_pilot``,
+    or the budget is exhausted. The best replay trajectory (smallest travel
+    time across attempts) is reported in ``summary["fastest"]``; metadata about
+    the replay loop is exposed in ``summary["replay"]``.
+    """
     cfg = parse_par2_inputs(params)
+
+    if cfg.save_trajectories and cfg.stop_mode not in ("first", "fraction"):
+        raise NotImplementedError(
+            "pypar2 pilot-then-replay supports save_trajectories with "
+            "stop_mode in {'first', 'fraction'} only."
+        )
 
     resolved_snapshots = None
     if cfg.snapshot_mode is not None and cfg.snapshot_times is not None:
@@ -1082,18 +1237,88 @@ def particle_tracking_par2_gpu_summary(params):
                 cfg.snapshot_mode, cfg.snapshot_times, None
             )
         else:
-            pass1, _, _ = _run_once(cfg, snapshot_times=None, force_trajectories=False)
+            pilot_pre, _, _ = _run_once(cfg, snapshot_times=None, force_trajectories=False)
             resolved_snapshots = resolve_snapshot_times(
                 cfg.snapshot_mode,
                 cfg.snapshot_times,
-                _successful_times(pass1["raw_times"], pass1["status"]),
+                _successful_times(pilot_pre["raw_times"], pilot_pre["status"]),
             )
 
-    force_trajectories = cfg.save_trajectories or cfg.tracking_mode == "trajectory" or cfg.return_fastest
-    result, taichi_arch, trajectories_enabled = _run_once(
-        cfg, snapshot_times=resolved_snapshots, force_trajectories=force_trajectories
+    # Pass 1: pilot, no trajectory storage. O(N) scalar fields only.
+    pilot_result, taichi_arch, _ = _run_once(
+        cfg, snapshot_times=resolved_snapshots, force_trajectories=False
     )
-    return _build_summary(cfg, result, taichi_arch, resolved_snapshots, trajectories_enabled)
+    pilot_travel_times = _successful_times(pilot_result["raw_times"], pilot_result["status"])
+    n_arrived = int(np.count_nonzero(np.isfinite(pilot_travel_times)))
+
+    # Bail out paths.
+    if not cfg.return_fastest or n_arrived == 0:
+        return _build_summary(
+            cfg, pilot_result, taichi_arch, resolved_snapshots, trajectories_enabled=False
+        )
+
+    # Top-K release points from the pilot.
+    k = min(int(cfg.replay_top_k), n_arrived)
+    masked = np.where(np.isfinite(pilot_travel_times), pilot_travel_times, np.inf)
+    if k >= n_arrived:
+        top_ids = np.argsort(masked)[:k]
+    else:
+        top_ids = np.argpartition(masked, k - 1)[:k]
+        top_ids = top_ids[np.argsort(masked[top_ids])]
+    top_ids = np.asarray(top_ids, dtype=np.int64)
+    centers = np.stack([cfg.seeds_x[top_ids], cfg.seeds_y[top_ids]], axis=1).astype(np.float32)
+    t_pilot = float(pilot_travel_times[top_ids[0]])
+
+    # Pass 2: retry loop.
+    attempts_log = []
+    best = None
+    accepted = False
+    for attempt in range(int(cfg.replay_max_redos) + 1):
+        r = _run_replay_attempt(cfg, centers, attempt_idx=attempt)
+        attempts_log.append(
+            {
+                "attempt": int(attempt),
+                "n_arrived": int(r["n_arrived"]),
+                "t_best": (None if r["t_best"] is None else float(r["t_best"])),
+            }
+        )
+        if r["t_best"] is not None and (best is None or r["t_best"] < best["t"]):
+            best = {
+                "t": float(r["t_best"]),
+                "x": r["x"],
+                "y": r["y"],
+                "t_arr": r["t_arr"],
+                "attempt": int(attempt),
+            }
+        if r["t_best"] is not None and r["t_best"] <= t_pilot * float(cfg.replay_tolerance):
+            accepted = True
+            break
+
+    summary = _build_summary(
+        cfg, pilot_result, taichi_arch, resolved_snapshots, trajectories_enabled=False
+    )
+    summary["replay"] = {
+        "status": "accepted" if accepted else ("exhausted" if best is not None else "no_replay_arrival"),
+        "t_pilot": float(t_pilot),
+        "t_replay_best": (None if best is None else float(best["t"])),
+        "attempts": attempts_log,
+        "top_k_particle_ids": top_ids.astype(np.int32),
+        "release_points": centers,
+        "tolerance": float(cfg.replay_tolerance),
+        "max_redos": int(cfg.replay_max_redos),
+    }
+
+    if best is not None:
+        summary["fastest"] = {
+            "particle_id": -1,
+            "travel_time": np.float32(best["t"]),
+            "x": best["x"],
+            "y": best["y"],
+            "t": best["t_arr"],
+            "source": "replay",
+            "replay_attempt": int(best["attempt"]),
+        }
+    return summary
 
 
 def particle_tracking_pollock_gpu_summary(params):

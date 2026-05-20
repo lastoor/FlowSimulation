@@ -691,6 +691,41 @@ def _parse_args():
         help="Backend for PyPar2 (Taichi RWPT); maps to taichi_arch internally.",
     )
     p.add_argument(
+        "--pypar2-replay-top-k",
+        type=int,
+        default=5,
+        help="PyPar2 replay: top-K fastest pilot particles whose release points seed pass-2.",
+    )
+    p.add_argument(
+        "--pypar2-replay-particles-per-center",
+        type=int,
+        default=40,
+        help="PyPar2 replay: particles per top-K release point in pass-2.",
+    )
+    p.add_argument(
+        "--pypar2-replay-radius-cells",
+        type=float,
+        default=0.5,
+        help="PyPar2 replay: pass-2 disk radius in units of dx (0.0 = exact resample).",
+    )
+    p.add_argument(
+        "--pypar2-replay-tolerance",
+        type=float,
+        default=1.05,
+        help="PyPar2 replay: accept pass-2 when t_best <= t_pilot * tolerance.",
+    )
+    p.add_argument(
+        "--pypar2-replay-max-redos",
+        type=int,
+        default=3,
+        help="PyPar2 replay: max additional pass-2 retries (total attempts = this + 1).",
+    )
+    p.add_argument(
+        "--pypar2-disable-replay",
+        action="store_true",
+        help="Disable the pass-2 replay loop entirely (sets replay_max_redos=0 and treats the pilot's endpoint as the result).",
+    )
+    p.add_argument(
         "--no-modpath",
         action="store_true",
         help="Do not run MODPATH7 in the comparison.",
@@ -720,6 +755,11 @@ def _parse_args():
         use_rk4_fp=use_rk4_fp,
         use_pypar2=use_pypar2,
         pypar2_backend=args.pypar2_backend,
+        pypar2_replay_top_k=int(args.pypar2_replay_top_k),
+        pypar2_replay_particles_per_center=int(args.pypar2_replay_particles_per_center),
+        pypar2_replay_radius_cells=float(args.pypar2_replay_radius_cells),
+        pypar2_replay_tolerance=float(args.pypar2_replay_tolerance),
+        pypar2_replay_max_redos=(0 if args.pypar2_disable_replay else int(args.pypar2_replay_max_redos)),
         use_modpath=use_modpath,
     )
 
@@ -1075,15 +1115,25 @@ def _run_case(
                 "dt": dt_compare,
                 "steps": max_steps_compare,
                 "max_points": max_points,
+                "replay_top_k": int(opts.pypar2_replay_top_k),
+                "replay_particles_per_center": int(opts.pypar2_replay_particles_per_center),
+                "replay_radius_cells": float(opts.pypar2_replay_radius_cells),
+                "replay_tolerance": float(opts.pypar2_replay_tolerance),
+                "replay_max_redos": int(opts.pypar2_replay_max_redos),
             }
             pypar2_summary = particle_tracking_summary(pypar2_params)
             pypar2_res = pypar2_summary.get("fastest")
+            pypar2_replay = pypar2_summary.get("replay", {}) or {}
             if pypar2_res is None:
                 print("Warning: PyPar2 returned no fastest path (no particle reached right_x).")
             else:
                 print(
                     f"PyPar2 ({opts.pypar2_backend}) fastest path computed "
-                    f"(taichi_arch={pypar2_summary.get('taichi_arch')})."
+                    f"(taichi_arch={pypar2_summary.get('taichi_arch')}, "
+                    f"replay_status={pypar2_replay.get('status', 'NA')}, "
+                    f"t_pilot={pypar2_replay.get('t_pilot', 'NA')}, "
+                    f"t_replay_best={pypar2_replay.get('t_replay_best', 'NA')}, "
+                    f"attempts={len(pypar2_replay.get('attempts', []))})."
                 )
         except Exception as e:
             print(f"Warning: PyPar2 skipped ({e}).")
