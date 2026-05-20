@@ -939,6 +939,42 @@ def _make_tracker_cls():
                     self.final_times[p] = self.elapsed[p]
                     self.active[p] = 0
 
+        def _reload(self, cfg, snapshot_times=None):
+            """Re-populate input fields in place for a cached tracker.
+
+            Assumes the cache key contract: all shape and kernel-baked scalar
+            attributes (n_particles, dt, steps, dx, dy, right_x, dm, alpha_l,
+            alpha_t, velocity_floor, n_snaps, store_trajectories, n_traj) match
+            the cached instance. Only field contents (velocity, seeds, theta,
+            snapshot times) and the Python-side ``seed`` are updated.
+            """
+            if int(cfg.seeds_x.size) != int(self.n_particles):
+                raise ValueError(
+                    f"Par2RWPT2D._reload: n_particles mismatch "
+                    f"({cfg.seeds_x.size} vs cached {self.n_particles})."
+                )
+            self.seed = int(cfg.seed)
+
+            cvx, cvy = compute_corner_velocities(cfg.vx, cfg.vy)
+            self.x_faces.from_numpy(cfg.x_faces)
+            self.y_faces.from_numpy(cfg.y_faces)
+            self.vx_faces.from_numpy(cfg.vx)
+            self.vy_faces.from_numpy(cfg.vy)
+            self.cvx.from_numpy(cvx)
+            self.cvy.from_numpy(cvy)
+            self.theta_corners.from_numpy(cfg.theta_corners)
+            self.seed_x.from_numpy(cfg.seeds_x.astype(np.float32))
+            self.seed_y.from_numpy(cfg.seeds_y.astype(np.float32))
+
+            if snapshot_times is not None and self.n_snaps > 0:
+                snap_np = np.sort(np.asarray(snapshot_times, dtype=np.float32).ravel())
+                if int(snap_np.size) != int(self.n_snaps):
+                    raise ValueError(
+                        "Par2RWPT2D._reload: snapshot count mismatch "
+                        f"({snap_np.size} vs cached {self.n_snaps})."
+                    )
+                self.snap_times.from_numpy(snap_np)
+
         def run(self):
             self._reset_output_fields()
             self.rng_state.from_numpy(_initial_rng_states(self.seed, self.n_particles))
@@ -1086,14 +1122,69 @@ def _build_summary(cfg, result, taichi_arch, resolved_snapshots, trajectories_en
     return summary
 
 
+_tracker_cache: dict = {}
+
+
+def _tracker_cache_key(cfg: Par2Inputs, store_trajectories: bool, snapshot_times):
+    """Build a cache key covering every shape and kernel-baked scalar.
+
+    Taichi @ti.kernel methods bake Python-side scalars at first trace; reusing
+    a tracker only safe if every such scalar matches. Shape attributes
+    (n_particles, n_snaps, n_traj, nx, ny) must also match so that
+    ``from_numpy`` calls land in compatible buffers.
+    """
+    n_snaps = 0 if snapshot_times is None else int(np.asarray(snapshot_times).size)
+    if store_trajectories:
+        n_traj = int(make_store_steps(int(cfg.steps), int(cfg.max_points)).size)
+    else:
+        n_traj = 1
+    return (
+        int(cfg.seeds_x.size),
+        int(n_snaps),
+        bool(store_trajectories),
+        int(n_traj),
+        int(cfg.x_faces.size),
+        int(cfg.y_faces.size),
+        float(cfg.dt),
+        int(cfg.steps),
+        float(cfg.dx),
+        float(cfg.dy),
+        float(cfg.right_x),
+        float(cfg.molecular_diffusion),
+        float(cfg.alpha_l),
+        float(cfg.alpha_t),
+        float(cfg.velocity_floor),
+        float(cfg.x_faces[0]),
+        float(cfg.x_faces[-1]),
+        float(cfg.y_faces[0]),
+        float(cfg.y_faces[-1]),
+    )
+
+
 def _run_once(cfg: Par2Inputs, snapshot_times=None, force_trajectories=False):
+    """Run one pypar2 forward pass, reusing a cached tracker when shape matches.
+
+    Without caching every call would allocate a fresh ``Par2RWPT2D`` instance,
+    and Taichi never frees its ``ti.field`` allocations until the global
+    runtime is reset (which we cannot do, since other modules — e.g.
+    ``pollock_gpu`` — share the runtime). That cumulative leak is what was
+    triggering ``CUDA_ERROR_ASSERT`` after ~85 MCs. Caching by shape + scalars
+    means an FMM sweep allocates exactly two trackers across all MCs (one for
+    the pilot pass, one for the replay pass).
+    """
     taichi_arch = _ensure_ti_init(cfg.taichi_arch)
     Tracker = _make_tracker_cls()
     store_trajectories = bool(
         force_trajectories
         and cfg.seeds_x.size * max(1, cfg.max_points) <= cfg.trajectory_memory_limit
     )
-    tracker = Tracker(cfg, snapshot_times=snapshot_times, store_trajectories=store_trajectories)
+    key = _tracker_cache_key(cfg, store_trajectories, snapshot_times)
+    tracker = _tracker_cache.get(key)
+    if tracker is None:
+        tracker = Tracker(cfg, snapshot_times=snapshot_times, store_trajectories=store_trajectories)
+        _tracker_cache[key] = tracker
+    else:
+        tracker._reload(cfg, snapshot_times=snapshot_times)
     return tracker.run(), taichi_arch, store_trajectories
 
 
