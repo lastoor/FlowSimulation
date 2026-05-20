@@ -33,6 +33,15 @@ def _ensure_ti_init():
         return _ti_arch
     import taichi as ti
 
+    # Skip re-init if another FlowSimulation taichi-using module
+    # (e.g. pypar2) has already initialized Taichi in this process; calling
+    # ti.init again would reset the global runtime and wipe any persistent
+    # fields previously allocated by other modules.
+    if bool(getattr(ti, "_fs_taichi_initialized", False)):
+        _ti_arch = getattr(ti, "_fs_taichi_arch", None) or "gpu"
+        _ti_initialized = True
+        return _ti_arch
+
     try:
         ti.init(arch=ti.gpu, verbose=False)
         _ti_arch = "gpu"
@@ -45,6 +54,8 @@ def _ensure_ti_init():
         ti.init(arch=ti.cpu, verbose=False)
         _ti_arch = "cpu"
     _ti_initialized = True
+    setattr(ti, "_fs_taichi_initialized", True)
+    setattr(ti, "_fs_taichi_arch", _ti_arch)
     return _ti_arch
 
 

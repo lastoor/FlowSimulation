@@ -445,6 +445,28 @@ def _ensure_ti_init(preferred_arch="gpu"):
         return _ti_arch
     import taichi as ti
 
+    # If another FlowSimulation taichi-using module (e.g. pollock_gpu) has
+    # already initialized Taichi in this process, re-running ti.init would
+    # reset the global runtime and wipe any persistent fields allocated by
+    # those other modules. Detect that via a shared sentinel on the taichi
+    # module and a best-effort check on pollock_gpu's own init flag.
+    external_arch = None
+    if bool(getattr(ti, "_fs_taichi_initialized", False)):
+        external_arch = getattr(ti, "_fs_taichi_arch", None)
+    if external_arch is None:
+        try:
+            from . import pollock_gpu as _pg
+            if bool(getattr(_pg, "_ti_initialized", False)):
+                external_arch = getattr(_pg, "_ti_arch", None) or "gpu"
+        except Exception:
+            external_arch = None
+    if external_arch is not None:
+        _ti_initialized = True
+        _ti_arch = external_arch
+        setattr(ti, "_fs_taichi_initialized", True)
+        setattr(ti, "_fs_taichi_arch", _ti_arch)
+        return _ti_arch
+
     cache_path = os.environ.get(
         "PYPAR2_TAICHI_CACHE",
         os.path.join(tempfile.gettempdir(), "pypar2_ticache"),
@@ -460,6 +482,8 @@ def _ensure_ti_init(preferred_arch="gpu"):
         _probe_taichi_runtime(ti)
         _ti_initialized = True
         _ti_arch = "cpu"
+        setattr(ti, "_fs_taichi_initialized", True)
+        setattr(ti, "_fs_taichi_arch", _ti_arch)
         return _ti_arch
 
     try:
@@ -480,6 +504,8 @@ def _ensure_ti_init(preferred_arch="gpu"):
         _probe_taichi_runtime(ti)
         _ti_arch = "cpu"
     _ti_initialized = True
+    setattr(ti, "_fs_taichi_initialized", True)
+    setattr(ti, "_fs_taichi_arch", _ti_arch)
     return _ti_arch
 
 
