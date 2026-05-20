@@ -32,7 +32,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from simulation.config import create_par2_config, update_config_file
 from simulation.grf_generation import compute_c, fBmGenerator, generate_logk_field
-from simulation.hydraulic import read_mt3d_file, run_modflow, write_mt3d_file
+from simulation.hydraulic import (
+    compute_velocity,
+    read_mt3d_file,
+    run_modflow,
+    solve_head,
+    write_mt3d_file,
+)
 from simulation.particle_tracking import (
     fastest_trajectory,
     particle_tracking_cpu,
@@ -470,6 +476,7 @@ def _save_comparison_figure(
     rk45_cpu_res,
     rk45_gpu_res,
     rk4_fp_res,
+    pypar2_res,
     modpath_res,
     par2_trajs,
     par2_fast,
@@ -573,6 +580,16 @@ def _save_comparison_figure(
             label=f'Fastest Path (RK4 FP Taichi), t={rk4_fp_res["travel_time"]:.3g}',
         )
 
+    if pypar2_res is not None:
+        ax.plot(
+            pypar2_res["x"],
+            pypar2_res["y"],
+            color="#2CA02C",
+            linestyle=":",
+            lw=2.0,
+            label=f'Fastest Path (PyPar2 Taichi), t={pypar2_res["travel_time"]:.3g}',
+        )
+
     if modpath_res is not None:
         ax.plot(
             modpath_res["x"],
@@ -602,6 +619,12 @@ def _parse_args():
         choices=("fbm", "synthetic", "both"),
         default="fbm",
         help="Velocity field source: fbm (default), synthetic, or both.",
+    )
+    p.add_argument(
+        "--flow-solver",
+        choices=("petsc", "modflow"),
+        default="petsc",
+        help="Flow solver for the fbm case: PETSc (default, no external binary) or MODFLOW.",
     )
     p.add_argument(
         "--synthetic-shape-tol",
@@ -657,6 +680,17 @@ def _parse_args():
         help="Do not run RK4 FP (Taichi) in the comparison.",
     )
     p.add_argument(
+        "--no-pypar2",
+        action="store_true",
+        help="Do not run PyPar2 (Taichi RWPT) in the comparison.",
+    )
+    p.add_argument(
+        "--pypar2-backend",
+        choices=("cpu", "gpu"),
+        default="gpu",
+        help="Backend for PyPar2 (Taichi RWPT); maps to taichi_arch internally.",
+    )
+    p.add_argument(
         "--no-modpath",
         action="store_true",
         help="Do not run MODPATH7 in the comparison.",
@@ -668,11 +702,13 @@ def _parse_args():
     use_rk45_cpu = not args.no_rk45_cpu
     use_rk45_gpu = not args.no_rk45_gpu
     use_rk4_fp = not args.no_rk4_fp
+    use_pypar2 = not args.no_pypar2
     use_modpath = not args.no_modpath
-    if not (use_par2 or use_pollock_cpu or use_pollock_gpu or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_modpath):
+    if not (use_par2 or use_pollock_cpu or use_pollock_gpu or use_rk45_cpu or use_rk45_gpu or use_rk4_fp or use_pypar2 or use_modpath):
         p.error("At least one algorithm must be enabled (do not pass all --no-* flags).")
     return argparse.Namespace(
         test_case=args.test_case,
+        flow_solver=args.flow_solver,
         synthetic_shape_tol=float(args.synthetic_shape_tol),
         synthetic_time_gap_min=float(args.synthetic_time_gap_min),
         velocity_location=args.velocity_location,
@@ -682,6 +718,8 @@ def _parse_args():
         use_rk45_cpu=use_rk45_cpu,
         use_rk45_gpu=use_rk45_gpu,
         use_rk4_fp=use_rk4_fp,
+        use_pypar2=use_pypar2,
+        pypar2_backend=args.pypar2_backend,
         use_modpath=use_modpath,
     )
 
@@ -1017,6 +1055,39 @@ def _run_case(
         except Exception as e:
             print(f"Warning: RK4 FP skipped ({e}).")
 
+    pypar2_res = None
+    if opts.use_pypar2:
+        try:
+            pypar2_params = {
+                "method": "pypar2",
+                "backend": opts.pypar2_backend,
+                "tracking_mode": "arrival",
+                "stop_mode": "first",
+                "save_trajectories": True,
+                "return_fastest": True,
+                "x_faces": x_faces,
+                "y_faces": y_faces,
+                "vx": np.asarray(vx_full, dtype=np.float32),
+                "vy": np.asarray(vy_full, dtype=np.float32),
+                "seeds_x": seeds_x,
+                "seeds_y": seeds_y,
+                "right_x": right_x,
+                "dt": dt_compare,
+                "steps": max_steps_compare,
+                "max_points": max_points,
+            }
+            pypar2_summary = particle_tracking_summary(pypar2_params)
+            pypar2_res = pypar2_summary.get("fastest")
+            if pypar2_res is None:
+                print("Warning: PyPar2 returned no fastest path (no particle reached right_x).")
+            else:
+                print(
+                    f"PyPar2 ({opts.pypar2_backend}) fastest path computed "
+                    f"(taichi_arch={pypar2_summary.get('taichi_arch')})."
+                )
+        except Exception as e:
+            print(f"Warning: PyPar2 skipped ({e}).")
+
     modpath_res = None
     if opts.use_modpath and modpath_model_name is not None:
         modpath_res = _run_modpath7_and_extract_fastest(
@@ -1052,6 +1123,8 @@ def _run_case(
         print(f"  RK45 GPU:  {rk45_gpu_res['travel_time']:.6g}" if rk45_gpu_res is not None else "  RK45 GPU:  (skipped)")
     if opts.use_rk4_fp:
         print(f"  RK4 FP:    {rk4_fp_res['travel_time']:.6g}" if rk4_fp_res is not None else "  RK4 FP:    (skipped)")
+    if opts.use_pypar2:
+        print(f"  PyPar2:    {pypar2_res['travel_time']:.6g}" if pypar2_res is not None else "  PyPar2:    (skipped)")
     if opts.use_modpath and modpath_model_name is not None:
         print(f"  MODPATH7:  {modpath_res['travel_time']:.6g}" if modpath_res is not None else "  MODPATH7:  (skipped)")
     print("---")
@@ -1113,6 +1186,14 @@ def _run_case(
         save_kw["rk4_fp_x"] = np.array([], dtype=np.float64)
         save_kw["rk4_fp_y"] = np.array([], dtype=np.float64)
         save_kw["rk4_fp_time"] = np.nan
+    if pypar2_res is not None:
+        save_kw["pypar2_x"] = pypar2_res["x"]
+        save_kw["pypar2_y"] = pypar2_res["y"]
+        save_kw["pypar2_time"] = pypar2_res["travel_time"]
+    else:
+        save_kw["pypar2_x"] = np.array([], dtype=np.float64)
+        save_kw["pypar2_y"] = np.array([], dtype=np.float64)
+        save_kw["pypar2_time"] = np.nan
     if par2_fast is not None:
         save_kw["par2_x"] = par2_fast[:, 0]
         save_kw["par2_y"] = par2_fast[:, 1]
@@ -1145,6 +1226,7 @@ def _run_case(
                 "RK45 CPU": rk45_cpu_res,
                 "RK45 GPU": rk45_gpu_res,
                 "RK4 FP": rk4_fp_res,
+                "PyPar2": pypar2_res,
             },
             shape_tol=opts.synthetic_shape_tol,
             time_gap_min=opts.synthetic_time_gap_min,
@@ -1171,6 +1253,7 @@ def _run_case(
         rk45_cpu_res=rk45_cpu_res,
         rk45_gpu_res=rk45_gpu_res,
         rk4_fp_res=rk4_fp_res,
+        pypar2_res=pypar2_res,
         modpath_res=modpath_res,
         par2_trajs=par2_trajs,
         par2_fast=par2_fast,
@@ -1189,6 +1272,7 @@ def _run_case(
             rk45_cpu_res=rk45_cpu_res,
             rk45_gpu_res=rk45_gpu_res,
             rk4_fp_res=rk4_fp_res,
+            pypar2_res=pypar2_res,
             modpath_res=modpath_res,
             par2_trajs=par2_trajs,
             par2_fast=par2_fast,
@@ -1219,9 +1303,16 @@ def main():
     run_fbm = opts.test_case in ("fbm", "both")
     run_synthetic = opts.test_case in ("synthetic", "both")
 
-    path_mf2005 = _resolve_executable("MODFLOW_EXE", "~/bin/mf2005", "MODFLOW") if run_fbm else None
+    use_modflow = run_fbm and opts.flow_solver == "modflow"
+    path_mf2005 = _resolve_executable("MODFLOW_EXE", "~/bin/mf2005", "MODFLOW") if use_modflow else None
     path_par2 = _resolve_executable("PAR2_EXE", "~/bin/par2", "PAR2") if opts.use_par2 else None
-    path_mp7 = _resolve_executable("MODPATH_EXE", "~/bin/mp7", "MODPATH7") if (opts.use_modpath and run_fbm) else None
+    path_mp7 = (
+        _resolve_executable("MODPATH_EXE", "~/bin/mp7", "MODPATH7")
+        if (opts.use_modpath and use_modflow)
+        else None
+    )
+    if run_fbm and not use_modflow and opts.use_modpath:
+        print("Note: MODPATH7 requires MODFLOW; auto-disabled because --flow-solver=petsc.")
 
     ly = num_pt
     lx = num_pt
@@ -1264,33 +1355,77 @@ def main():
             raise RuntimeError("Failed to generate a valid 2D log-K field.")
         np.savetxt(path_out / "logk_field.dat", logk_field, delimiter=" ")
 
-        mf2005_config = {
-            "modflow_exe": str(path_mf2005),
-            "model_ws": str(path_mfoutput),
-            "model_name": "mf2005_model",
-            "outftl_name": str(path_mfoutput / "mf2005_model_modified.ftl"),
-            "grad_head": grad_head,
-            "lx": int(logk_field.shape[1]),
-            "ly": int(logk_field.shape[0]),
-            "lz": 1,
-            "dx": dx,
-            "dy": dy,
-            "dz": dz,
-            "logk_field": logk_field,
-        }
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ResourceWarning)
-            return_msg_mf = run_modflow(mf2005_config)
-        print(return_msg_mf)
-        if "successfully" not in return_msg_mf.lower():
-            raise RuntimeError(f"MODFLOW run failed: {return_msg_mf}")
+        if use_modflow:
+            mf2005_config = {
+                "modflow_exe": str(path_mf2005),
+                "model_ws": str(path_mfoutput),
+                "model_name": "mf2005_model",
+                "outftl_name": str(path_mfoutput / "mf2005_model_modified.ftl"),
+                "grad_head": grad_head,
+                "lx": int(logk_field.shape[1]),
+                "ly": int(logk_field.shape[0]),
+                "lz": 1,
+                "dx": dx,
+                "dy": dy,
+                "dz": dz,
+                "logk_field": logk_field,
+            }
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                return_msg_mf = run_modflow(mf2005_config)
+            print(return_msg_mf)
+            if "successfully" not in return_msg_mf.lower():
+                raise RuntimeError(f"MODFLOW run failed: {return_msg_mf}")
 
-        velocity_field = read_mt3d_file(str(path_mfoutput / "mf2005_model_modified.ftl"))
-        if "QXX" not in velocity_field or "QYY" not in velocity_field:
-            raise KeyError("FTL file does not contain expected QXX/QYY velocity fields.")
-        vx_trim_fbm = np.asarray(velocity_field["QXX"], dtype=np.float64)
-        vy_trim_fbm = np.asarray(velocity_field["QYY"], dtype=np.float64)
-        vx_full_fbm, vy_full_fbm = _trimmed_face_fields_to_full(vx_trim_fbm, vy_trim_fbm)
+            velocity_field = read_mt3d_file(str(path_mfoutput / "mf2005_model_modified.ftl"))
+            if "QXX" not in velocity_field or "QYY" not in velocity_field:
+                raise KeyError("FTL file does not contain expected QXX/QYY velocity fields.")
+            vx_trim_fbm = np.asarray(velocity_field["QXX"], dtype=np.float64)
+            vy_trim_fbm = np.asarray(velocity_field["QYY"], dtype=np.float64)
+            vx_full_fbm, vy_full_fbm = _trimmed_face_fields_to_full(vx_trim_fbm, vy_trim_fbm)
+        else:
+            print("Solving flow with PETSc (no MODFLOW binary required).")
+            K_fbm = np.exp(logk_field)
+            x_centers_petsc = np.arange(logk_field.shape[1], dtype=np.float64) * float(dx)
+            y_centers_petsc = np.arange(logk_field.shape[0], dtype=np.float64) * float(dy)
+            h_petsc, msg_petsc, ok_petsc = solve_head(
+                K_fbm,
+                x_centers_petsc,
+                y_centers_petsc,
+                dh=grad_head,
+                spacing_mode="center_faces",
+            )
+            print(f"PETSc solver: {msg_petsc}")
+            if not ok_petsc:
+                raise RuntimeError(f"PETSc head solve failed: {msg_petsc}")
+            vx_full_fbm, vy_full_fbm = compute_velocity(
+                K_fbm,
+                x_centers_petsc,
+                y_centers_petsc,
+                h_petsc,
+                output_location="face",
+                align_with_modflow=True,
+                face_output="full",
+            )
+            vx_full_fbm = np.asarray(vx_full_fbm, dtype=np.float64)
+            vy_full_fbm = np.asarray(vy_full_fbm, dtype=np.float64)
+            vx_trim_fbm = vx_full_fbm[:, 1:]
+            vy_trim_fbm = vy_full_fbm[1:, :]
+            if opts.use_par2:
+                ftl_path_fbm = path_mfoutput / "mf2005_model_modified.ftl"
+                ly_fbm, lx_fbm = vx_trim_fbm.shape
+                cnh_fbm = []
+                for jrow in range(ly_fbm):
+                    cnh_fbm.append([1, jrow + 1, 1, float(grad_head * (lx_fbm - 1) * dx)])
+                    cnh_fbm.append([1, jrow + 1, lx_fbm, 0.0])
+                vars_ftl_fbm = {
+                    "header": " 'MT3D4.00.00'           0           0           0           0           0           0         200           1           1           0           0           0           0           0           0           0           0           0           0           0           0",
+                    "THKSAT": -111.0 * np.ones((ly_fbm, lx_fbm), dtype=np.float64),
+                    "QXX": np.asarray(vx_trim_fbm, dtype=np.float64),
+                    "QYY": np.asarray(vy_trim_fbm, dtype=np.float64),
+                    "CNH": np.asarray(cnh_fbm, dtype=np.float64),
+                }
+                write_mt3d_file(str(ftl_path_fbm), vars_ftl_fbm)
         x_centers_fbm = np.arange(vx_trim_fbm.shape[1], dtype=np.float32) * np.float32(dx)
         y_centers_fbm = np.arange(vx_trim_fbm.shape[0], dtype=np.float32) * np.float32(dy)
         x_faces_fbm, y_faces_fbm = _build_face_coords_from_centers(x_centers_fbm, y_centers_fbm)
@@ -1340,7 +1475,7 @@ def main():
             background_label="log10 K",
             title=f"Fastest path (velocity from log-fBm conductivity, {opts.velocity_location} mode): PAR2 vs Pollock vs RK45 CPU/GPU vs RK4 FP vs MODPATH7",
             expected_synthetic=None,
-            modpath_model_name="mf2005_model",
+            modpath_model_name="mf2005_model" if use_modflow else None,
         )
 
     if run_synthetic:

@@ -92,8 +92,8 @@ def _resolve_method_and_backend(params):
     method = params.get("method")
     if method is None:
         method = "rk45" if backend == "cpu" else "rk4"
-    if method not in ("pollock", "rk45", "rk4"):
-        raise ValueError("method must be 'pollock', 'rk45', or 'rk4'.")
+    if method not in ("pollock", "rk45", "rk4", "pypar2"):
+        raise ValueError("method must be 'pollock', 'rk45', 'rk4', or 'pypar2'.")
     return method, backend
 
 
@@ -123,6 +123,12 @@ def particle_tracking_summary(params):
             raise ValueError("method='rk4' currently supports backend='gpu' only.")
         from .rk4_fp import rk4_particle_tracking_summary
         return rk4_particle_tracking_summary(params)
+
+    if method == "pypar2":
+        from .pypar2 import particle_tracking_par2_gpu_summary
+        forwarded = dict(params)
+        forwarded.setdefault("taichi_arch", backend)
+        return particle_tracking_par2_gpu_summary(forwarded)
 
     if backend == "cpu":
         return particle_tracking_cpu_summary(params)
