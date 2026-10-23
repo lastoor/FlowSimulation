@@ -35,6 +35,17 @@ pip install -r requirements.txt
 
 `requirements.txt` includes the core runtime packages plus comparison / visualization dependencies that are imported by scripts and tests. GPU-oriented packages such as `cupy` and `taichi` are included for environments that use those paths.
 
+## Ergodicity concentration snapshots (macOS)
+Run the local ensemble and two-panel analysis figure with:
+
+```bash
+bash scripts/run_ergodicity_mac.sh
+```
+
+The driver uses `~/.conda/envs/taichi/bin/python` by default. Set `PYTHON_BIN` to another environment's Python and `OUTPUT_DIR` to change the result directory. `NUM_REALIZATIONS`, `NUM_PARTICLES`, `T_STAR`, `LY`, `LOGK_VARIANCE`, `SOURCE_WIDTH`, `SOURCE_HEIGHT`, `DX`, `DT`, `SEED`, and `ANALYSIS_SEED` override the driver defaults. Additional arguments pass to `ergodicity_simulation.py`; run either Python script with `--help` for its full CLI.
+
+The simulation writes `manifest.json`, `grid.npz`, and one `concentration_XXXX.npz` file per realization. Concentration is particle count per cell normalized so the expected initial concentration in the source is 1. The analysis reads only these saved files and writes `ergodicity_comparison.png`. Its spatial and ensemble statistics are descriptive: a finite localized plume is spatially nonstationary, so their agreement or disagreement alone is not a formal ergodicity test.
+
 ## Run the new hybrid script
 Use exactly one of `--std` or `--c`.
 
@@ -249,6 +260,7 @@ python tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py \
 ```
 
 ## Possible issues
+- The ergodicity figure compares a whole-domain spatial summary with an ensemble histogram at one cell. A localized plume is spatially nonstationary, so these descriptive statistics are not by themselves a formal test of concentration ergodicity.
 - `requirements.txt` includes optional GPU-oriented packages such as `cupy` and `taichi`; these may require environment-specific installation steps on machines without compatible GPU support.
 
 1. `solve_head` still defaults to `spacing_mode="uniform"` for backward compatibility; callers must opt in to `spacing_mode="center_faces"` to use coordinate-derived spacing.

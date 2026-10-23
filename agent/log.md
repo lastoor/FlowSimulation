@@ -1,5 +1,11 @@
 # Agent Log
 
+## 2026-10-22
+- Added `scripts/ergodicity_simulation.py` for independent exponential-covariance lognormal conductivity realizations, PETSc flow, PyPar2 physical-time plume snapshots, and normalized concentration grids.
+- Added `scripts/ergodicity_analysis.py` for the selected-realization map and fixed-cell ensemble histogram, plus `scripts/run_ergodicity_mac.sh` for local Taichi CPU runs.
+- Allowed a small extra PyPar2 step margin so float32 elapsed-time accumulation does not miss a snapshot exactly at the requested time.
+- Verified a two-realization smoke run, a longer-time snapshot, figure generation, and CLI validation on the local `taichi` environment.
+
 ## 2026-03-13 02:30:00 UTC
 - Recorded virtual-subcell Pollock as a future refinement for highly oscillatory velocity fields.
 - Noted that the high-frequency synthetic compare case is now a shared Pollock CPU/GPU modeling limitation rather than a backend mismatch: both backends agree, but the coarse-cell linear-in-cell Pollock assumption lags the expected lane/travel time.
