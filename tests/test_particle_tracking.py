@@ -16,6 +16,32 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from simulation import particle_tracking
 
 
+class TestPyPar2GridValidation(unittest.TestCase):
+    def test_fine_uniform_grid_is_checked_before_float32_conversion(self):
+        from simulation.particle_tracking.pypar2 import parse_par2_inputs
+
+        x_faces = np.linspace(0.0, 40.0, 801)
+        y_faces = np.linspace(0.0, 20.0, 401)
+        params = {
+            "x_faces": x_faces,
+            "y_faces": y_faces,
+            "vx": np.zeros((400, 801), dtype=np.float32),
+            "vy": np.zeros((401, 800), dtype=np.float32),
+            "seeds_x": [5.5],
+            "seeds_y": [10.0],
+            "dt": 0.05,
+            "steps": 2,
+        }
+        parsed = parse_par2_inputs(params)
+        self.assertAlmostEqual(float(parsed.dx), 0.05, places=6)
+        self.assertEqual(parsed.x_faces.dtype, np.float32)
+
+        bad_x_faces = x_faces.copy()
+        bad_x_faces[100] += 0.005
+        with self.assertRaisesRegex(ValueError, "uniformly spaced"):
+            parse_par2_inputs({**params, "x_faces": bad_x_faces})
+
+
 class TestParticleTracking(unittest.TestCase):
     """Test particle tracking functions."""
 
@@ -563,10 +589,11 @@ class TestParticleTracking(unittest.TestCase):
             self.skipTest(f"Taichi unavailable in this environment: {exc}")
 
         with mock.patch.object(pollock_gpu, "_ti_initialized", False):
-            with mock.patch("taichi.init", side_effect=[RuntimeError("gpu unavailable"), None]) as init_mock:
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
-                    arch = pollock_gpu._ensure_ti_init()
+            with mock.patch.object(taichi, "_fs_taichi_initialized", False, create=True):
+                with mock.patch("taichi.init", side_effect=[RuntimeError("gpu unavailable"), None]) as init_mock:
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        arch = pollock_gpu._ensure_ti_init()
 
         self.assertEqual(arch, "cpu")
         self.assertEqual(init_mock.call_count, 2)

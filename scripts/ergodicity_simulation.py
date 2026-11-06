@@ -32,7 +32,8 @@ def nonnegative(value: str) -> float:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--ly", type=positive, default=20.0, help="Domain height in I_Y; L_x=20 I_Y.")
+    p.add_argument("--lx", type=positive, default=20.0, help="Domain width in I_Y.")
+    p.add_argument("--ly", type=positive, default=20.0, help="Domain height in I_Y.")
     p.add_argument("--logk-variance", type=nonnegative, default=2.0)
     p.add_argument("--dx", type=positive, default=0.25, help="Square cell size in I_Y.")
     p.add_argument("--num-realizations", type=int, default=20)
@@ -61,14 +62,13 @@ def grid_count(length: float, dx: float, name: str) -> int:
 
 
 def geometry(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]:
-    lx = 20.0
-    nx = grid_count(lx, args.dx, "L_x")
+    nx = grid_count(args.lx, args.dx, "L_x")
     ny = grid_count(args.ly, args.dx, "L_y")
     x0, x1 = 5.0, 5.0 + args.source_width
     y0, y1 = (args.ly - args.source_height) / 2, (args.ly + args.source_height) / 2
-    if min(x0, lx - x1, y0, args.ly - y1) < 5.0 - 1e-10:
+    if min(x0, args.lx - x1, y0, args.ly - y1) < 5.0 - 1e-10:
         raise ValueError("source must remain at least 5 I_Y from all four boundaries")
-    x_faces = np.linspace(0.0, lx, nx + 1)
+    x_faces = np.linspace(0.0, args.lx, nx + 1)
     y_faces = np.linspace(0.0, args.ly, ny + 1)
     return x_faces, y_faces, (x0, x1, y0, y1)
 
@@ -146,7 +146,7 @@ def run(args: argparse.Namespace) -> None:
         print(f"[{index + 1}/{args.num_realizations}] {filename}: {active}/{args.num_particles} active", flush=True)
     metadata = vars(args).copy()
     metadata["output_dir"] = str(args.output_dir)
-    metadata.update({"lx": 20.0, "integral_scale_y": 1.0,
+    metadata.update({"integral_scale_y": 1.0,
                      "source_bounds": list(source), "steps": steps,
                      "concentration_units": "relative to expected initial source concentration",
                      "files": files})

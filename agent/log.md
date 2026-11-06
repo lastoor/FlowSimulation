@@ -1,5 +1,33 @@
 # Agent Log
 
+## 2026-11-06 (solid regions and PDF bounds)
+- Filled source and sample regions on the three maps, removed spatial-region graphics from the histogram, and saved maps with tight PDF bounds so colorbar tick labels remain visible.
+- Regenerated the four PDFs from saved data and visually checked the filled overlays, histogram legend, and colorbar ticks before committing.
+
+## 2026-11-06 (region annotations)
+- Added source and sample outlines plus legends to all four analysis PDFs, using a domain inset on the histogram; matched map colorbar heights to the plotted axes.
+
+## 2026-11-06 (analysis-only driver)
+- Added `ANALYSIS_ONLY=1` to skip simulation and regenerate PDFs from saved ensemble output.
+
+## 2026-11-06 (ensemble analysis PDFs)
+- Added odd `--window-size` and optional `--hist-bins` to ergodicity analysis, with matching `WINDOW_SIZE` and `HIST_BINS` driver overrides.
+- Replaced the combined PNG with four separate PDFs: selected realization, sample-window histogram, ensemble mean field, and ensemble variance field.
+- Verified a 3-by-3 sample with seven histogram bins on saved simulation data, rendered and inspected all four PDFs, checked driver argument forwarding, and rejected an even window size.
+
+## 2026-11-06 (sample cell controls)
+- Added `CELL_X` and `CELL_Y` environment overrides to the macOS ergodicity driver and passed them through to the analysis CLI, preserving the (10, 10) defaults.
+
+## 2026-11-06 (PyPar2 fine-grid fix)
+- Fixed PyPar2 face-grid validation to check original float64 coordinates before converting them to float32 for Taichi. The `LX=40`, `DX=0.05` shell defaults previously failed the uniform-spacing check because of float32 roundoff.
+- Added a regression test for the fine uniform grid and for a genuinely nonuniform grid.
+- Isolated the Pollock GPU fallback test from Taichi's shared initialization sentinel so the full particle-tracking module can run after other Taichi tests.
+- Verified the regression test, a one-realization `DX=0.05` simulation, and the full particle-tracking module (39 tests, 8 GPU-dependent skips on this Mac).
+
+## 2026-11-06
+- Made both dimensions of the ergodicity conductivity field configurable: `--lx` and `--ly` in the simulation CLI, with `LX` and `LY` overrides in the macOS driver.
+- Kept the default 20-by-20 domain and the 5-integral-scale source clearance, and recorded the selected width in the run manifest.
+
 ## 2026-10-22
 - Added `scripts/ergodicity_simulation.py` for independent exponential-covariance lognormal conductivity realizations, PETSc flow, PyPar2 physical-time plume snapshots, and normalized concentration grids.
 - Added `scripts/ergodicity_analysis.py` for the selected-realization map and fixed-cell ensemble histogram, plus `scripts/run_ergodicity_mac.sh` for local Taichi CPU runs.

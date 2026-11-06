@@ -58,10 +58,13 @@ class Par2Inputs:
 
 def require_uniform_faces(faces: np.ndarray, name: str) -> np.float32:
     """Validate a 1D uniform face-coordinate array and return its spacing."""
-    faces = np.asarray(faces, dtype=np.float32)
+    # Check the supplied coordinates before converting to Taichi's float32.
+    # At fine spacing, float32 rounding makes a uniform grid's differences
+    # appear nonuniform (for example, dx=0.05 over a 40-unit domain).
+    faces = np.asarray(faces, dtype=np.float64)
     if faces.ndim != 1 or faces.size < 2:
         raise ValueError(f"{name} must be a 1D array with at least 2 values.")
-    diffs = np.diff(faces).astype(np.float32)
+    diffs = np.diff(faces)
     if np.any(diffs <= 0):
         raise ValueError(f"{name} must be strictly increasing.")
     if not np.allclose(diffs, diffs[0], rtol=1.0e-5, atol=1.0e-7):
@@ -317,10 +320,12 @@ def parse_par2_inputs(params: dict) -> Par2Inputs:
     if not isinstance(params, dict):
         raise TypeError("params must be a dictionary.")
 
-    x_faces = np.asarray(params["x_faces"], dtype=np.float32).ravel()
-    y_faces = np.asarray(params["y_faces"], dtype=np.float32).ravel()
+    x_faces = np.asarray(params["x_faces"], dtype=np.float64).ravel()
+    y_faces = np.asarray(params["y_faces"], dtype=np.float64).ravel()
     dx = require_uniform_faces(x_faces, "x_faces")
     dy = require_uniform_faces(y_faces, "y_faces")
+    x_faces = x_faces.astype(np.float32)
+    y_faces = y_faces.astype(np.float32)
 
     vx = np.asarray(params["vx"], dtype=np.float32)
     vy = np.asarray(params["vy"], dtype=np.float32)

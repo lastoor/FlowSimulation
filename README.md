@@ -36,15 +36,19 @@ pip install -r requirements.txt
 `requirements.txt` includes the core runtime packages plus comparison / visualization dependencies that are imported by scripts and tests. GPU-oriented packages such as `cupy` and `taichi` are included for environments that use those paths.
 
 ## Ergodicity concentration snapshots (macOS)
-Run the local ensemble and two-panel analysis figure with:
+Run the local ensemble and four-figure PDF analysis with:
 
 ```bash
 bash scripts/run_ergodicity_mac.sh
 ```
 
-The driver uses `~/.conda/envs/taichi/bin/python` by default. Set `PYTHON_BIN` to another environment's Python and `OUTPUT_DIR` to change the result directory. `NUM_REALIZATIONS`, `NUM_PARTICLES`, `T_STAR`, `LY`, `LOGK_VARIANCE`, `SOURCE_WIDTH`, `SOURCE_HEIGHT`, `DX`, `DT`, `SEED`, and `ANALYSIS_SEED` override the driver defaults. Additional arguments pass to `ergodicity_simulation.py`; run either Python script with `--help` for its full CLI.
+To regenerate only the four analysis PDFs from an existing `OUTPUT_DIR`, use `ANALYSIS_ONLY=1 bash scripts/run_ergodicity_mac.sh`. Set `CELL_X`, `CELL_Y`, `WINDOW_SIZE`, and `HIST_BINS` as needed.
 
-The simulation writes `manifest.json`, `grid.npz`, and one `concentration_XXXX.npz` file per realization. Concentration is particle count per cell normalized so the expected initial concentration in the source is 1. The analysis reads only these saved files and writes `ergodicity_comparison.png`. Its spatial and ensemble statistics are descriptive: a finite localized plume is spatially nonstationary, so their agreement or disagreement alone is not a formal ergodicity test.
+The driver uses `~/.conda/envs/taichi/bin/python` by default. Set `PYTHON_BIN` to another environment's Python and `OUTPUT_DIR` to change the result directory. `NUM_REALIZATIONS`, `NUM_PARTICLES`, `T_STAR`, `LX`, `LY`, `LOGK_VARIANCE`, `SOURCE_WIDTH`, `SOURCE_HEIGHT`, `DX`, `DT`, `SEED`, `ANALYSIS_SEED`, `CELL_X`, `CELL_Y`, `WINDOW_SIZE`, and `HIST_BINS` override the driver defaults. `LX` and `LY` set the field dimensions in units of the integral scale (driver defaults: 40 and 20); each must be an integer multiple of `DX`, and the source must retain a 5-integral-scale buffer on all sides. `CELL_X` and `CELL_Y` select the ensemble histogram cell (driver defaults: 20 and 10). Additional arguments pass to `ergodicity_simulation.py`; run either Python script with `--help` for its full CLI.
+
+The simulation writes `manifest.json`, `grid.npz`, and one `concentration_XXXX.npz` file per realization. Concentration is particle count per cell normalized so the expected initial concentration in the source is 1. The analysis reads only these saved files and writes four PDFs: `sample_realization.pdf`, `sample_histogram.pdf`, `ensemble_mean.pdf`, and `ensemble_variance.pdf`. The three maps show solid source and sample regions with a legend; the histogram shows only the concentration distribution and ensemble-mean legend. Map colorbars match plot height and include their tick labels inside the PDF bounds. Set `WINDOW_SIZE=3` or `5` in the driver (or `--window-size` in the analysis CLI) to average concentration over a centered 3-by-3 or 5-by-5 cell region for each realization; the full region must fit inside the grid. Set `HIST_BINS` (or `--hist-bins`) to override the histogram's automatic bin count. The ensemble maps show cellwise population mean and variance across realizations. These spatial and ensemble statistics are descriptive: a finite localized plume is spatially nonstationary, so their agreement or disagreement alone is not a formal ergodicity test.
+
+PyPar2 checks face-grid uniformity before converting coordinates to float32 for Taichi. This permits fine uniform grids such as `LX=40 DX=0.05`, where float32 rounding otherwise makes adjacent face differences appear unequal.
 
 ## Run the new hybrid script
 Use exactly one of `--std` or `--c`.
@@ -260,6 +264,7 @@ python tests/Compare_Modflow_PETSc/test_compare_modflow_petsc.py \
 ```
 
 ## Possible issues
+- Taichi-backed tests share process-wide initialization state, so fallback tests must clear the shared initialization sentinel when mocking startup. The PyPar2 and Pollock backends still cannot safely switch Taichi architectures within one process after initialization.
 - The ergodicity figure compares a whole-domain spatial summary with an ensemble histogram at one cell. A localized plume is spatially nonstationary, so these descriptive statistics are not by themselves a formal test of concentration ergodicity.
 - `requirements.txt` includes optional GPU-oriented packages such as `cupy` and `taichi`; these may require environment-specific installation steps on machines without compatible GPU support.
 
